@@ -248,6 +248,49 @@ All settings accept both CLI flags (`--bichon-http-port`) and environment variab
 |----------|---------|-------------|
 | `BICHON_ENABLE_REST_HTTPS` | `false` | Serve the API over HTTPS (requires valid certificate) |
 
+### OpenID Connect (OIDC) Single Sign-On
+
+Bichon can delegate WebUI authentication to any OIDC provider (Authentik,
+Keycloak, PocketID, Authelia, Zitadel, Dex, …) using the Authorization
+Code flow with PKCE.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BICHON_OIDC_ENABLED` | `false` | Master switch for OIDC single sign-on |
+| `BICHON_OIDC_ISSUER_URL` | — | Issuer URL. Bichon appends `/.well-known/openid-configuration` for discovery. Example: `https://auth.example.com/application/o/bichon/` |
+| `BICHON_OIDC_CLIENT_ID` | — | OAuth2 client ID registered with the IdP |
+| `BICHON_OIDC_CLIENT_SECRET` | — | OAuth2 client secret registered with the IdP |
+| `BICHON_OIDC_REDIRECT_URI` | — | Redirect URI registered with the IdP. Must resolve to `<public-url>/api/auth/oidc/callback` |
+| `BICHON_OIDC_DEFAULT_ROLE_ID` | `100200000000000` (Member) | Global role ID assigned to auto-provisioned OIDC users |
+| `BICHON_OIDC_AUTO_REDIRECT` | `false` | When true, `/sign-in` immediately redirects to the IdP. Local login stays reachable via `/sign-in?local=1` |
+
+**User resolution.** On each login Bichon looks up the user by
+`(sso_provider, sso_id)` first, then by `email`, and finally auto-provisions
+a new user with `BICHON_OIDC_DEFAULT_ROLE_ID`. The `sub` claim from the IdP
+is stored on the user and used for subsequent logins.
+
+**Signature verification.** Asymmetric tokens (`RS256`, `RS384`, `RS512`,
+`ES256`) are verified against the provider's JWKS, fetched from the
+`jwks_uri` in discovery and cached for an hour; an unknown `kid` triggers one
+re-fetch, rate-limited so a bad token cannot be used to hammer the provider.
+`HS256` is verified with the client secret. Unsigned tokens (`alg: none`) and
+every other algorithm are rejected, and the key type must match the
+algorithm family, so an RSA key cannot be pressed into service as an HMAC
+secret. Discovery, issuer, audience, expiration (with 60 s skew), and nonce
+are validated; when the token carries several audiences, `azp` is required.
+
+**Token handoff.** After a successful callback the SPA receives a one-shot
+handoff id in the URL and POSTs it to `/api/auth/oidc/handoff` to obtain the
+WebUI access token in the response body. The access token itself is never
+placed in the URL, so it does not leak into browser history, `Referer`
+headers, or server access logs.
+
+> [!IMPORTANT]
+> Set `BICHON_OIDC_REDIRECT_URI` to the exact value you registered with the
+> IdP (including scheme, host, port, and path). The IdP rejects mismatched
+> callbacks. Behind a reverse proxy this must be the externally-reachable
+> URL, not `http://localhost:15630`.
+
 ### SMTP Server
 
 | Variable | Default | Description |
@@ -693,11 +736,12 @@ No. Bichon is an **archiver**, not an email client. The optional SMTP server **r
 - [x] Embedded SMTP server
 - [x] Data migration tooling (v0.3.7 / v1.x → v2.x)
 - [x] On-demand manual download controls
+- [x] Enterprise SSO (OIDC)
 - [ ] Post-download server cleanup (free remote mailbox space)
 - [ ] Account-to-account email merge / migration
 - [ ] MCP Server for LLM-powered email search and analysis
 - [ ] S3-compatible storage backend
-- [ ] Enterprise SSO (OIDC / SAML)
+- [ ] Enterprise SSO (SAML)
 
 ## Contributing
 

@@ -1,0 +1,51 @@
+# Dependencies whose install scripts are allowed to run. pnpm 10+ blocks all of
+# them by default, and pnpm 11 makes `pnpm run <script>` fail outright while any
+# are still pending — so without this list `pnpm install && pnpm run build`
+# breaks, in CI as well as locally.
+#
+# Every entry is a build-time toolchain package that does not work without its
+# script: esbuild and @swc/core fetch or link their native binary, and
+# @parcel/watcher builds its file-watching addon. msw copies its service worker
+# into public/ for the test suite.
+#
+# `allowBuilds` is the pnpm 11 spelling, `onlyBuiltDependencies` the pnpm 10 one;
+# both are listed so either version installs the same way.
+
+# This directory is the only package. Without it the file declares a workspace
+# with no members, and `pnpm exec` then fails with "No package found in this
+# workspace" even though `pnpm install` and `pnpm run` still work.
+packages:
+  - .
+
+allowBuilds:
+  '@parcel/watcher': true
+  '@swc/core': true
+  esbuild: true
+  msw: true
+
+onlyBuiltDependencies:
+  - '@parcel/watcher'
+  - '@swc/core'
+  - esbuild
+  - msw
+
+# Transitive packages pulled in below a patched release. Each entry is the fix
+# for an advisory that `pnpm audit --audit-level high --prod` reports, and each is
+# pinned inside its own major so no dependent sees a breaking change. Drop an
+# entry once the parent package resolves the fixed version on its own.
+overrides:
+  # ReDoS via extglob (the 4.x copies in the tree are unaffected).
+  picomatch@2: ^2.3.2
+  # Arbitrary file read, and path traversal via a previous source map.
+  postcss: ^8.5.18
+  # Three separate DoS advisories, one per release line present.
+  brace-expansion@1: ^1.1.12
+  brace-expansion@2: ^2.1.4
+  # Command injection in the glob CLI.
+  glob@10: ^10.5.0
+  # Code injection via _.template.
+  lodash: ^4.17.24
+  # ReDoS in matchOne() and in nested extglobs (3.x is unaffected).
+  minimatch@9: ^9.0.7
+  # Non-secure generators can loop indefinitely.
+  nanoid@3: ^3.3.18

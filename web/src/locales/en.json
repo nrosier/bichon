@@ -572,7 +572,11 @@
     "sessionExpired": "Session expired!",
     "sessionExpiredDesc": "Your session has ended due to inactivity. Please log in again to continue.",
     "somethingWentWrong": "Something went wrong",
+    "ssoCompleting": "Completing sign-in...",
+    "ssoFailed": "Single sign-on failed",
+    "ssoHandoffFailed": "The sign-in could not be completed.",
     "ssoLogin": "Sign in with SSO",
+    "ssoRedirecting": "Redirecting to your identity provider...",
     "username": "Username",
     "welcome": "Welcome to Bichon",
     "youWillNeedToLogInAgain": "You will need to log in again to access your account."

@@ -1,0 +1,187 @@
+name: Docker Build and Push
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Nothing in this workflow writes to the repository.
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: bichon
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Fails in seconds if the image has nowhere to go, rather than after a
+  # twenty-minute Rust build. Kept in its own job so the credentials are not in
+  # the build job's environment while third-party build and scan code runs.
+  preflight:
+    name: Check Docker Hub credentials
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify the secrets are set
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          missing=""
+          [ -n "${DOCKERHUB_USERNAME:-}" ] || missing="DOCKERHUB_USERNAME"
+          [ -n "${DOCKERHUB_TOKEN:-}" ] || missing="$missing DOCKERHUB_TOKEN"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secret(s):$missing. Add them under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+  image:
+    name: Build, scan and push linux/amd64 (main)
+    needs: preflight
+    # Pinned to the release the image is built FROM, so the binaries link
+    # against the same glibc they will run against.
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      # Both values end up in OCI labels, so a running container can be traced
+      # back to the exact commit and the moment it was built.
+      - name: Stamp the build
+        id: stamp
+        run: |
+          set -euo pipefail
+          echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          echo "version=$(grep '^version' Cargo.toml | head -n1 | cut -d '"' -f2)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Rust
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          cargo --version
+
+      - name: Cache cargo registry and build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-release-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-release-${{ runner.os }}-
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install pnpm
+        # Pinned: pnpm 11 turned pending dependency build scripts into a hard
+        # error, so an unpinned install can break this workflow without a commit.
+        run: npm install -g pnpm@11
+
+      - name: Build the web UI
+        working-directory: ./web
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+          pnpm run build
+
+      - name: Build the release binaries
+        run: cargo build --release --locked
+
+      - name: Stage the binaries for the image
+        run: |
+          set -euo pipefail
+          # The Dockerfile copies from <arch>/ so one context can serve several
+          # architectures. Only amd64 is published.
+          # `[profile.release] strip = true` in Cargo.toml already stripped these.
+          mkdir -p docker/amd64
+          for binary in bichon-server bichon-cli bichon-admin; do
+            install -m 0755 "target/release/$binary" "docker/amd64/$binary"
+          done
+          cp LICENSE docker/amd64/LICENSE
+          ls -l docker/amd64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build the image into the local daemon
+        uses: docker/build-push-action@v7
+        with:
+          context: ./docker
+          platforms: linux/amd64
+          # Into the daemon rather than the registry: the scan below decides
+          # whether this image is ever published.
+          load: true
+          push: false
+          no-cache: true
+          tags: ${{ env.IMAGE_NAME }}:candidate
+          build-args: |
+            CRATE_VERSION=${{ steps.stamp.outputs.version }}
+            GIT_COMMIT=${{ github.sha }}
+            BUILT_AT=${{ steps.stamp.outputs.built_at }}
+
+      - name: Scan the image
+        # This is the gate. A CRITICAL or HIGH with a fix available stops the
+        # push, so a vulnerable image never reaches Docker Hub.
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:candidate
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+          exit-code: '1'
+
+      - name: Generate the SBOM
+        # From the same local image the scan just approved.
+        # build-push-action's native `sbom: true` is deliberately not used: it
+        # only attaches an attestation when buildx pushes the manifest itself,
+        # which it does not here.
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: 'image'
+          image-ref: ${{ env.IMAGE_NAME }}:candidate
+          format: 'cyclonedx'
+          output: 'sbom.cdx.json'
+
+      - name: Upload the SBOM
+        uses: actions/upload-artifact@v7
+        with:
+          name: sbom-${{ github.sha }}
+          path: sbom.cdx.json
+          if-no-files-found: error
+          retention-days: 90
+
+      # Only now do registry credentials enter this job's environment: every
+      # third-party build and scan step above ran without them.
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Tag and push
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          set -euo pipefail
+          repo="$DOCKERHUB_USERNAME/$IMAGE_NAME"
+          # `:latest` deliberately stays untouched here. It is published by
+          # release.yml on a version tag and means "newest release"; if this
+          # workflow claimed it too, the first commit after a release would
+          # quietly replace the released image with an unreleased build for
+          # everyone pulling the default tag. Main gets its own moving tag plus
+          # an immutable per-commit one.
+          short="${GITHUB_SHA:0:12}"
+          docker tag "$IMAGE_NAME:candidate" "$repo:main"
+          docker tag "$IMAGE_NAME:candidate" "$repo:main-$short"
+          docker push "$repo:main"
+          docker push "$repo:main-$short"
+          echo "Pushed $repo:main and $repo:main-$short"

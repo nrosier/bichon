@@ -2,6 +2,7 @@
 name = "bichon-core"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 
 [features]
@@ -39,6 +40,7 @@ utf7-imap.workspace = true
 mail-parser.workspace = true
 tokio-rustls.workspace = true
 oauth2.workspace = true
+url.workspace = true
 sysinfo.workspace = true
 num_cpus.workspace = true
 rand.workspace = true

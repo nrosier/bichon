@@ -561,6 +561,11 @@
     "sessionExpired": "Sessão Expirada!",
     "sessionExpiredDesc": "Sua sessão terminou devido à inatividade. Por favor, faça login novamente para continuar.",
     "somethingWentWrong": "Algo deu errado",
+    "ssoCompleting": "Concluindo o login...",
+    "ssoFailed": "Falha no login SSO",
+    "ssoHandoffFailed": "Não foi possível concluir o login.",
+    "ssoLogin": "Entrar com SSO",
+    "ssoRedirecting": "Redirecionando para seu provedor de identidade...",
     "username": "Nome de Usuário",
     "welcome": "Bem-vindo ao Bichon",
     "youWillNeedToLogInAgain": "Você precisará fazer login novamente para acessar sua conta."

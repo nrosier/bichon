@@ -561,6 +561,11 @@
     "sessionExpired": "Istunto vanhentunut!",
     "sessionExpiredDesc": "Istuntosi on päättynyt toimettomuuden vuoksi. Kirjaudu sisään jatkaaksesi.",
     "somethingWentWrong": "Jotain meni vikaan",
+    "ssoCompleting": "Viimeistellään kirjautumista...",
+    "ssoFailed": "Kertakirjautuminen epäonnistui",
+    "ssoHandoffFailed": "Kirjautumista ei voitu viimeistellä.",
+    "ssoLogin": "Kirjaudu SSO:lla",
+    "ssoRedirecting": "Ohjataan tunnistautumispalveluun...",
     "username": "Käyttäjänimi",
     "welcome": "Tervetuloa Bichoniin",
     "youWillNeedToLogInAgain": "Sinun on kirjauduttava sisään uudelleen päästäksesi tilillesi."

@@ -9,13 +9,36 @@ env:
   BINARY_NAME: bichon-server
   BINARY_CLI: bichon-cli
   BINARY_ADMIN: bichon-admin
+  IMAGE_NAME: bichon
 
 permissions:
   contents: write
 
 jobs:
+  # Fails in seconds if the image would have nowhere to go, rather than after the
+  # six-target matrix and the GitHub release have already run. Kept in its own job
+  # so the credentials are not in any build job's environment.
+  preflight:
+    name: Check Docker Hub credentials
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify the secrets are set
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          missing=""
+          [ -n "${DOCKERHUB_USERNAME:-}" ] || missing="DOCKERHUB_USERNAME"
+          [ -n "${DOCKERHUB_TOKEN:-}" ] || missing="$missing DOCKERHUB_TOKEN"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secret(s):$missing. Add them under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
   build:
     name: Build ${{ matrix.target }}
+    needs: preflight
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -67,7 +90,9 @@ jobs:
           node-version: 20
 
       - name: Install pnpm
-        run: npm install -g pnpm
+        # Pinned: pnpm 11 turned pending dependency build scripts into a hard
+        # error, so an unpinned install can break a release without a commit.
+        run: npm install -g pnpm@11
 
       - name: Build frontend (web)
         working-directory: ./web
@@ -175,58 +200,114 @@ jobs:
           files: |
             artifacts/*
   docker:
-    name: Build and Push Docker Image
+    name: Build, scan and push linux/amd64 image
     needs: [build, release]
-    runs-on: ubuntu-latest
-    
+    # Pinned to the release the image is built FROM, so the binaries link against
+    # the same glibc they will run against.
+    runs-on: ubuntu-24.04
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        
+
       - name: Download Linux x86_64 artifact
         uses: actions/download-artifact@v4
         with:
           name: x86_64-unknown-linux-gnu
           path: artifacts
 
-      - name: Download Linux aarch64 artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: aarch64-unknown-linux-gnu
-          path: artifacts
-          
-      - name: Extract amd64 binary
+      - name: Extract the amd64 binaries
         run: |
+          set -euo pipefail
+          # The Dockerfile copies from <arch>/ so one context could serve several
+          # architectures. Only amd64 is published.
           mkdir -p docker/amd64
           AMD64_FILE=$(ls artifacts | grep x86_64-unknown-linux-gnu.tar.gz)
           echo "Extracting $AMD64_FILE"
-          tar -xzf artifacts/$AMD64_FILE -C docker/amd64
+          tar -xzf "artifacts/$AMD64_FILE" -C docker/amd64
+          ls -l docker/amd64
 
-      - name: Extract arm64 binary
+      # Ends up in an OCI label, so a running container can be traced back to the
+      # moment it was built. The commit comes from github.sha.
+      - name: Stamp the build
+        id: stamp
         run: |
-          mkdir -p docker/arm64
-          ARM64_FILE=$(ls artifacts | grep aarch64-unknown-linux-gnu.tar.gz)
-          echo "Extracting $ARM64_FILE"
-          tar -xzf artifacts/$ARM64_FILE -C docker/arm64
-          
+          set -euo pipefail
+          echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build the image into the local daemon
+        uses: docker/build-push-action@v7
+        with:
+          context: ./docker
+          platforms: linux/amd64
+          # Into the daemon rather than the registry: the scan below decides
+          # whether this image is ever published.
+          load: true
+          push: false
+          no-cache: true
+          tags: ${{ env.IMAGE_NAME }}:candidate
+          build-args: |
+            CRATE_VERSION=${{ github.ref_name }}
+            GIT_COMMIT=${{ github.sha }}
+            BUILT_AT=${{ steps.stamp.outputs.built_at }}
+
+      - name: Scan the image
+        # This is the gate. A CRITICAL or HIGH with a fix available stops the
+        # push, so a vulnerable image never reaches Docker Hub.
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:candidate
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+          exit-code: '1'
+
+      - name: Generate the SBOM
+        # From the same local image the scan just approved.
+        # build-push-action's native `sbom: true` is deliberately not used: it
+        # only attaches an attestation when buildx pushes the manifest itself,
+        # which it does not here.
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: 'image'
+          image-ref: ${{ env.IMAGE_NAME }}:candidate
+          format: 'cyclonedx'
+          output: 'sbom.cdx.json'
+
+      - name: Upload the SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ github.ref_name }}
+          path: sbom.cdx.json
+          if-no-files-found: error
+          retention-days: 90
+
+      # Only now do registry credentials enter this job's environment: every
+      # third-party build and scan step above ran without them.
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-          
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: ./docker
-          push: true
-          platforms: linux/amd64,linux/arm64
-          tags: |
-            rustmailer/bichon:${{ github.ref_name }}
-            rustmailer/bichon:latest
-          build-args: |
-            CRATE_VERSION=${{ github.ref_name }}
-        
+
+      - name: Tag and push
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          repo="$DOCKERHUB_USERNAME/$IMAGE_NAME"
+          docker tag "$IMAGE_NAME:candidate" "$repo:$TAG"
+          docker push "$repo:$TAG"
+          # A pre-release tag (2.0.1-rc1) must not become :latest.
+          case "$TAG" in
+            *-*) echo "Pre-release $TAG: leaving :latest alone" ;;
+            *)
+              docker tag "$IMAGE_NAME:candidate" "$repo:latest"
+              docker push "$repo:latest"
+              ;;
+          esac
+          echo "Pushed $repo:$TAG"

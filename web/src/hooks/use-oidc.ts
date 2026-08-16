@@ -16,28 +16,27 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use poem::{handler, web::Json, IntoResponse};
-use serde::Serialize;
+import { useQuery } from '@tanstack/react-query'
+import { oidc_config } from '@/api/oidc/api'
 
-#[derive(Serialize)]
-struct FeaturesResponse {
-    features: Vec<String>,
-    edition: &'static str,
-    version: String,
-}
+/**
+ * Whether SSO is available on this server.
+ *
+ * The endpoint is public, so this also works on the sign-in page where there is
+ * no token yet. `isLoading` matters there: the page must not flash the password
+ * form before it knows whether to redirect straight to the provider.
+ */
+export function useOidc() {
+  const { data, isLoading } = useQuery({
+    queryKey: ['oidc-config'],
+    queryFn: oidc_config,
+    staleTime: Infinity,
+    retry: 1,
+  })
 
-#[handler]
-pub async fn get_features() -> impl IntoResponse {
-    let mut features = Vec::new();
-    // Advertised only when OIDC is switched on and configured, so the SPA can
-    // show the SSO button without a second round trip.
-    if bichon_core::oidc::is_available() {
-        features.push("sso".to_string());
-    }
-
-    Json(FeaturesResponse {
-        features,
-        edition: "community",
-        version: env!("CARGO_PKG_VERSION").to_string(),
-    })
+  return {
+    ssoEnabled: data?.enabled ?? false,
+    autoRedirect: data?.auto_redirect ?? false,
+    isLoading,
+  } as const
 }

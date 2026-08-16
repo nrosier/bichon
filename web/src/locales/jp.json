@@ -561,6 +561,11 @@
     "sessionExpired": "セッションの有効期限が切れました！",
     "sessionExpiredDesc": "操作がないためセッションが終了しました。継続するには再度ログインしてください。",
     "somethingWentWrong": "問題が発生しました",
+    "ssoCompleting": "サインインを完了しています...",
+    "ssoFailed": "シングルサインオンに失敗しました",
+    "ssoHandoffFailed": "サインインを完了できませんでした。",
+    "ssoLogin": "SSO でサインイン",
+    "ssoRedirecting": "ID プロバイダーにリダイレクトしています...",
     "username": "ユーザー名",
     "welcome": "Bichon へようこそ",
     "youWillNeedToLogInAgain": "アカウントにアクセスするには、再度ログインする必要があります。"

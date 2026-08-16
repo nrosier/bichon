@@ -20,6 +20,8 @@
 pub mod common;
 pub mod error;
 pub mod rest;
+#[cfg(test)]
+mod tests;
 
 use std::sync::LazyLock;
 

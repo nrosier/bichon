@@ -561,6 +561,11 @@
     "sessionExpired": "انتهت صلاحية الجلسة!",
     "sessionExpiredDesc": "انتهت جلستك بسبب عدم النشاط. يرجى تسجيل الدخول مرة أخرى للمتابعة.",
     "somethingWentWrong": "حدث خطأ ما",
+    "ssoCompleting": "جارٍ إكمال تسجيل الدخول...",
+    "ssoFailed": "فشل الدخول الموحّد",
+    "ssoHandoffFailed": "لم يتم إكمال تسجيل الدخول.",
+    "ssoLogin": "تسجيل الدخول عبر SSO",
+    "ssoRedirecting": "جارٍ إعادة التوجيه إلى مزوّد الهوية...",
     "username": "اسم المستخدم",
     "welcome": "مرحبًا بك في بيشون",
     "youWillNeedToLogInAgain": "ستحتاج إلى تسجيل الدخول مرة أخرى للوصول إلى حسابك."

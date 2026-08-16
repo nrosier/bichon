@@ -2,11 +2,24 @@
 FROM ubuntu:24.04
 ARG CRATE_VERSION
 ARG TARGETARCH
+# Build provenance. Both default to empty so a plain `docker build` still works.
+ARG GIT_COMMIT=""
+ARG BUILT_AT=""
 
 # Set maintainer metadata
 LABEL maintainer="rustmailer <rustmailer.git@gmail.com>"
 LABEL version="${CRATE_VERSION}"
 LABEL description="Dockerized Bichon service"
+
+# Standard annotations, so `docker inspect` on a running container is enough to
+# find the commit it was built from.
+LABEL org.opencontainers.image.title="Bichon"
+LABEL org.opencontainers.image.description="A lightweight, high-performance Rust email archiver with WebUI"
+LABEL org.opencontainers.image.source="https://github.com/rustmailer/bichon"
+LABEL org.opencontainers.image.licenses="AGPL-3.0-or-later"
+LABEL org.opencontainers.image.version="${CRATE_VERSION}"
+LABEL org.opencontainers.image.revision="${GIT_COMMIT}"
+LABEL org.opencontainers.image.created="${BUILT_AT}"
 
 # Set working directory
 WORKDIR /opt/bichon

@@ -571,6 +571,11 @@
     "sessionExpired": "会话已过期！",
     "sessionExpiredDesc": "由于长时间未活动，您的会话已结束。请重新登录以继续。",
     "somethingWentWrong": "出错了",
+    "ssoCompleting": "正在完成登录...",
+    "ssoFailed": "单点登录失败",
+    "ssoHandoffFailed": "无法完成登录。",
+    "ssoLogin": "使用 SSO 登录",
+    "ssoRedirecting": "正在跳转到身份提供商...",
     "username": "用户名",
     "welcome": "欢迎使用 Bichon",
     "youWillNeedToLogInAgain": "您需要重新登录才能访问您的账户。"

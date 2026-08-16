@@ -30,6 +30,7 @@ struct AccountResp {
     email: String,
     enabled: bool,
     account_name: Option<String>,
+    deleting: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,12 +116,21 @@ async fn account_crud() {
     resp.assert_status_is_ok();
 
     // ── Verify deleted ──────────────────────────────────────────────────
+    // Deletion is deliberately two-phase: the request marks the account
+    // `deleting` and disabled, then a spawned task clears the heavy resources
+    // (Tantivy segments, attachments) off the request path. So the record is
+    // still readable here, and the flags are what the endpoint promises. The
+    // frontend renders that state, and the reverted flags on cleanup failure
+    // are what lets the user retry.
     let resp = cli
         .get(&format!("/api/v1/account/{}", account_id))
         .header("Authorization", &format!("Bearer {}", token))
         .send()
         .await;
-    assert!(resp.0.status().is_client_error(), "should be 4xx after delete");
+    resp.assert_status_is_ok();
+    let deleted: AccountResp = resp.json().await.value().deserialize();
+    assert!(deleted.deleting, "delete should mark the account as deleting");
+    assert!(!deleted.enabled, "delete should disable the account");
 }
 
 #[tokio::test]

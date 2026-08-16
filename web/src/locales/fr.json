@@ -561,6 +561,11 @@
     "sessionExpired": "Session expirée !",
     "sessionExpiredDesc": "Votre session a été fermée en raison de l'inactivité. Veuillez vous reconnecter pour continuer.",
     "somethingWentWrong": "Quelque chose s'est mal passé",
+    "ssoCompleting": "Finalisation de la connexion...",
+    "ssoFailed": "Échec de l'authentification unique",
+    "ssoHandoffFailed": "La connexion n'a pas pu être finalisée.",
+    "ssoLogin": "Se connecter avec SSO",
+    "ssoRedirecting": "Redirection vers votre fournisseur d'identité...",
     "username": "Nom d'utilisateur",
     "welcome": "Bienvenue sur Bichon",
     "youWillNeedToLogInAgain": "Vous devrez vous reconnecter pour accéder à votre compte."

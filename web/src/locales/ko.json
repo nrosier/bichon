@@ -561,6 +561,11 @@
     "sessionExpired": "세션이 만료되었습니다!",
     "sessionExpiredDesc": "비활성화로 인해 세션이 종료되었습니다. 계속하려면 다시 로그인하십시오.",
     "somethingWentWrong": "문제가 발생했습니다",
+    "ssoCompleting": "로그인을 완료하는 중...",
+    "ssoFailed": "Single Sign-On 실패",
+    "ssoHandoffFailed": "로그인을 완료할 수 없습니다.",
+    "ssoLogin": "SSO로 로그인",
+    "ssoRedirecting": "ID 공급자로 이동 중...",
     "username": "사용자 이름",
     "welcome": "Bichon에 오신 것을 환영합니다",
     "youWillNeedToLogInAgain": "계정에 접근하려면 다시 로그인해야 합니다."

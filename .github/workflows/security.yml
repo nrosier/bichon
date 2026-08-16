@@ -1,0 +1,147 @@
+name: Security Scan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Weekly, so newly published advisories against unchanged code are still
+  # found. Deliberately off the hour and off the half hour.
+  schedule:
+    - cron: '37 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  filesystem:
+    name: Trivy filesystem and config
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Scan the working tree
+        # Lockfiles and embedded secrets. The image itself is scanned in
+        # docker.yml, where the finding can still gate the push.
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          scanners: 'vuln,secret'
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+          exit-code: '1'
+
+      - name: Scan the Dockerfile and other config
+        # Reports without gating: the image intentionally still runs as root,
+        # and switching to a non-root user would break write access to the
+        # /data volumes of existing deployments. Turn exit-code to 1 once that
+        # is addressed.
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: 'config'
+          scan-ref: '.'
+          format: 'table'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+          exit-code: '0'
+
+  rust:
+    name: cargo audit and cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      - name: Cache the audit tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-audit
+            ~/.cargo/bin/cargo-deny
+          key: audit-tools-${{ runner.os }}-v1
+
+      - name: Install cargo-audit and cargo-deny
+        run: |
+          set -euo pipefail
+          # --locked keeps the tools themselves reproducible.
+          command -v cargo-audit >/dev/null || cargo install cargo-audit --locked
+          command -v cargo-deny  >/dev/null || cargo install cargo-deny  --locked
+
+      - name: cargo audit
+        # Known vulnerabilities in the dependency tree, from the RustSec
+        # advisory database.
+        run: cargo audit --deny warnings
+
+      - name: cargo deny
+        # Advisories again (different database view), plus licence compatibility,
+        # banned or duplicated crates, and unexpected sources. Configured in
+        # deny.toml.
+        run: cargo deny --all-features check
+
+  web:
+    name: pnpm audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install pnpm
+        run: npm install -g pnpm@11
+
+      - name: Install dependencies
+        working-directory: ./web
+        run: pnpm install --frozen-lockfile
+
+      - name: pnpm audit (runtime dependencies)
+        working-directory: ./web
+        # The gate. --prod is the half of the tree that reaches a browser, so a
+        # high or critical advisory here is a shipped one. Transitive packages
+        # that lag behind a fixed release are forced forward by the `overrides`
+        # block in web/pnpm-workspace.yaml.
+        run: pnpm audit --audit-level high --prod
+
+      - name: pnpm audit (full tree, report only)
+        working-directory: ./web
+        # Build tooling — vite, rollup, vitest and friends. Worth seeing, but a
+        # ReDoS in a bundler that only ever runs on this runner is not a reason to
+        # block a release, and the fixes arrive on someone else's schedule.
+        continue-on-error: true
+        run: pnpm audit --audit-level high
+
+  secrets:
+    name: Gitleaks secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v7
+        with:
+          # Gitleaks scans commits, not just the tip: a key that was committed
+          # and later removed is still in the history, and still leaked.
+          fetch-depth: 0
+
+      - name: Scan the history
+        # Run from the published image rather than the marketplace action, which
+        # would need an organisation licence key.
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/repo" -w /repo \
+            zricethezav/gitleaks:latest \
+            git --redact --verbose --no-banner

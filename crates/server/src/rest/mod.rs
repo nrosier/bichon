@@ -37,6 +37,9 @@ use poem::listener::{Listener, TcpListener};
 use poem::middleware::{CatchPanic, Compression, Cors};
 use poem::{get, post, Endpoint, EndpointExt, Route, Server};
 use public::oauth2::oauth2_callback;
+use public::oidc::{
+    oidc_callback, oidc_config, oidc_handoff, oidc_local_logout, oidc_login, oidc_logout,
+};
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -114,6 +117,14 @@ pub fn build_routes() -> impl Endpoint {
         .nest("/api/v1/features", get(get_features))
         .nest("/api/status", get(get_status))
         .nest("/api/login", post(login))
+        // Unauthenticated by design: this is how a browser without a token
+        // obtains one. Each handler does its own validation.
+        .nest("/api/auth/oidc/config", get(oidc_config))
+        .nest("/api/auth/oidc/login", get(oidc_login))
+        .nest("/api/auth/oidc/callback", get(oidc_callback))
+        .nest("/api/auth/oidc/handoff", post(oidc_handoff))
+        .nest("/api/auth/oidc/local-logout", post(oidc_local_logout))
+        .nest("/api/auth/oidc/logout", get(oidc_logout))
         .nest_no_strip("/api/v1", open_api_route);
 
     let app_logic = add_web_assets(app_logic);

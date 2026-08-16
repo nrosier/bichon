@@ -6,6 +6,7 @@
 pub mod access_token_tests;
 pub mod account_tests;
 pub mod oauth2_tests;
+pub mod oidc_tests;
 pub mod proxy_tests;
 pub mod role_tests;
 pub mod system_tests;
@@ -53,6 +54,17 @@ pub async fn setup() {
     if *initialized {
         drop(initialized);
         return;
+    }
+
+    // `BICHON_ROOT_DIR` has no default, and `Settings` exits the process when it
+    // is missing — which would abort the whole test binary rather than fail one
+    // test. Supplying one here keeps a bare `cargo test` working; an explicit
+    // value in the environment still wins. The pid keeps concurrent cargo
+    // invocations off each other's data. This runs before the first read of
+    // `SETTINGS` below, which is what forces the lazy parse.
+    if std::env::var_os("BICHON_ROOT_DIR").is_none() {
+        let root = std::env::temp_dir().join(format!("bichon-test-{}", std::process::id()));
+        std::env::set_var("BICHON_ROOT_DIR", &root);
     }
 
     let root = PathBuf::from(&SETTINGS.bichon_root_dir);

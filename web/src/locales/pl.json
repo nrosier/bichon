@@ -561,6 +561,11 @@
     "sessionExpired": "Sesja wygasła",
     "sessionExpiredDesc": "Twoja sesja wygasła z powodu bezczynności. Zaloguj się ponownie",
     "somethingWentWrong": "Coś poszło nie tak",
+    "ssoCompleting": "Kończenie logowania...",
+    "ssoFailed": "Logowanie jednokrotne nie powiodło się",
+    "ssoHandoffFailed": "Nie udało się ukończyć logowania.",
+    "ssoLogin": "Zaloguj się przez SSO",
+    "ssoRedirecting": "Przekierowywanie do dostawcy tożsamości...",
     "username": "Nazwa",
     "welcome": "Witaj w Bichon",
     "youWillNeedToLogInAgain": "Musisz zalogować się ponownie, aby ponownie móc korzystać."

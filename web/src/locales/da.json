@@ -561,6 +561,11 @@
     "sessionExpired": "Session udløbet!",
     "sessionExpiredDesc": "Din session er afsluttet på grund af inaktivitet. Log venligst ind igen for at fortsætte.",
     "somethingWentWrong": "Noget gik galt",
+    "ssoCompleting": "Fuldfører login...",
+    "ssoFailed": "Single sign-on mislykkedes",
+    "ssoHandoffFailed": "Login kunne ikke fuldføres.",
+    "ssoLogin": "Log ind med SSO",
+    "ssoRedirecting": "Omdirigerer til din identitetsudbyder...",
     "username": "Brugernavn",
     "welcome": "Velkommen til Bichon",
     "youWillNeedToLogInAgain": "Du skal logge ind igen for at få adgang til din konto."

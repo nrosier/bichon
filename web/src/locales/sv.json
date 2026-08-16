@@ -561,6 +561,11 @@
     "sessionExpired": "Sessionen har löpt ut!",
     "sessionExpiredDesc": "Din session har avslutas på grund av inaktivitet. Vänligen logga in igen för att fortsätta.",
     "somethingWentWrong": "Något gick fel",
+    "ssoCompleting": "Slutför inloggning...",
+    "ssoFailed": "Single sign-on misslyckades",
+    "ssoHandoffFailed": "Inloggningen kunde inte slutföras.",
+    "ssoLogin": "Logga in med SSO",
+    "ssoRedirecting": "Omdirigerar till din identitetsleverantör...",
     "username": "Användarnamn",
     "welcome": "Välkommen till Bichon",
     "youWillNeedToLogInAgain": "Du måste logga in igen för att komma åt ditt konto."

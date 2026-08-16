@@ -1,0 +1,101 @@
+# cargo-deny configuration. Run locally with `cargo deny --all-features check`;
+# CI runs the same command in .github/workflows/security.yml.
+
+[graph]
+# Only the platforms Bichon ships binaries for. Without this, dependencies for
+# targets nobody builds (wasm, redox, ...) would drag their own advisories and
+# licences into every report.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+# Every entry here is a finding with no upgrade available at the time it was
+# added, plus the reason it is tolerable. Re-check them when dependencies move:
+# delete the entry rather than refresh it once a fix exists.
+ignore = [
+    # Reached only through poem's and poem-openapi's XML extractor, which this
+    # codebase never uses. Bichon's own XML parsing (autoconfig) depends on
+    # quick-xml 0.41, which carries both fixes. poem 3.1.12 is the latest
+    # release and still requires quick-xml 0.36, so there is nothing to update.
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.36 via poem; no poem release uses a fixed version, and the vulnerable extractor is unused" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.36 via poem; no poem release uses a fixed version, and the vulnerable extractor is unused" },
+    # Unmaintained, not vulnerable. bincode 1.x arrives through
+    # native_model -> native_db; bincode 2.x is a rewrite, so the fix has to come
+    # from upstream.
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1.x via native_model; unmaintained only, no upgrade path" },
+    # Unmaintained, not vulnerable. The successor is rustls-pki-types' PemObject,
+    # but poem also depends on rustls-pemfile, so porting bichon-smtp alone would
+    # not remove it from the tree.
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile via poem as well as bichon-smtp; unmaintained only, no upgrade path" },
+    # Unsound only if a panic escapes during LruCache::pop(). Arrives through
+    # tantivy 0.26.1, the latest release, which requires lru ^0.16; the fix is in
+    # 0.18.2. cargo-deny currently emits "no crate matched advisory criteria" for
+    # this one while cargo-audit does flag it — the two keep separate clones of
+    # the advisory database. Kept so this check does not turn red when
+    # cargo-deny's copy catches up.
+    { id = "RUSTSEC-2026-0253", reason = "lru 0.16 via tantivy, which cannot take the 0.18.2 fix" },
+]
+
+[licenses]
+version = 2
+# Every licence actually present in the tree, all permissive or weak-copyleft and
+# all compatible with distributing Bichon under the AGPL. Adding to this list is
+# a deliberate act: check that the new licence does not impose obligations the
+# project cannot meet.
+allow = [
+    "0BSD",
+    "AGPL-3.0-or-later", # Bichon's own crates
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    # File-level copyleft. Fine as long as these crates are used unmodified;
+    # currently only sse-codec and (as one option) htmlescape.
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+exceptions = []
+
+[bans]
+# Duplicate versions of the same crate are a fact of life in a tree this size,
+# so they are reported rather than blocked.
+multiple-versions = "warn"
+# A wildcard version requirement means the next breaking release lands silently.
+# Reported rather than blocked: the only wildcards in the tree are the workspace's
+# own path dependencies, and cargo-deny exempts those only for crates marked
+# `publish = false`. Worth revisiting if these crates are never published.
+wildcards = "warn"
+allow-wildcard-paths = true
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+# The project's own forks (async-imap, outlook-pst-rs) are pulled straight from
+# git. Allowing the org rather than the two URLs keeps unknown-git = "deny"
+# meaningful: a git dependency on anyone else's repository still fails.
+[sources.allow-org]
+github = ["rustmailer"]

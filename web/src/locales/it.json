@@ -561,6 +561,11 @@
     "sessionExpired": "Sessione scaduta!",
     "sessionExpiredDesc": "La tua sessione è terminata per inattività. Esegui nuovamente l'accesso per continuare.",
     "somethingWentWrong": "Qualcosa è andato storto",
+    "ssoCompleting": "Completamento dell'accesso...",
+    "ssoFailed": "Accesso SSO non riuscito",
+    "ssoHandoffFailed": "Non è stato possibile completare l'accesso.",
+    "ssoLogin": "Accedi con SSO",
+    "ssoRedirecting": "Reindirizzamento al tuo provider di identità...",
     "username": "Nome utente",
     "welcome": "Benvenuto in Bichon",
     "youWillNeedToLogInAgain": "Dovrai accedere nuovamente per accedere al tuo account."

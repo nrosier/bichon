@@ -1,0 +1,27 @@
+# cargo-audit configuration. Keep in sync with the `[advisories] ignore` list in
+# deny.toml at the repository root — the two tools read the same RustSec database
+# but do not share config, and CI runs both.
+#
+# Every ID below is a finding with no upgrade available at the time it was added.
+# When a dependency moves, delete the entry and let the tool confirm it is fixed
+# rather than refreshing the comment.
+
+[advisories]
+ignore = [
+    # quick-xml 0.36, reached only through poem's and poem-openapi's XML
+    # extractor, which this codebase never uses. Bichon's own XML parsing
+    # (autoconfig) is on quick-xml 0.41, which carries both fixes. poem 3.1.12 is
+    # the latest release and still requires 0.36.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+    # bincode 1.x via native_model -> native_db. Unmaintained, not vulnerable;
+    # bincode 2.x is a rewrite, so the move has to come from upstream.
+    "RUSTSEC-2025-0141",
+    # rustls-pemfile via poem as well as bichon-smtp. Unmaintained, not
+    # vulnerable; poem's dependency means porting bichon-smtp to
+    # rustls-pki-types' PemObject would not remove it from the tree.
+    "RUSTSEC-2025-0134",
+    # lru 0.16 via tantivy 0.26.1, the latest release, which requires ^0.16. The
+    # fix landed in 0.18.2. Unsound only under a panic inside LruCache::pop().
+    "RUSTSEC-2026-0253",
+]
