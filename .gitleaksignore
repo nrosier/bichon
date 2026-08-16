@@ -1,0 +1,35 @@
+# Findings from `gitleaks git` that have been reviewed and are not actionable in
+# CI. Fingerprint format is <commit>:<file>:<rule>:<line>.
+#
+# Adding a fingerprint here silences one specific historical finding. It does not
+# weaken the rule: the same pattern in a new commit produces a new fingerprint
+# and still fails the scan. Anything not listed below is a real, unreviewed
+# finding and should be treated as one.
+
+# ── config.toml: real tokens, already public, cannot be unpublished ──────────
+#
+# These are genuine bichon-cli access tokens. config.toml was listed in
+# .gitignore but never actually untracked, so five successive token rotations
+# were committed between 2026-01 and 2026-05. The file is untracked as of this
+# commit, so no further tokens can land this way.
+#
+# They are ignored here rather than fixed because removing them needs a history
+# rewrite (git filter-repo / BFG) plus a force-push, which breaks every existing
+# clone and fork — a decision for the repository owner, not for CI. The tokens
+# should be considered burned: revoke them under Settings > Access Tokens on any
+# instance where they were ever valid. Their scope is limited, since the
+# accompanying base_url is http://localhost:15630.
+d40ba90b54ddbcf3b8e24079ea365f614dc6a608:config.toml:generic-api-key:2
+fa70437a62dfb7d3c01e47b51191207eb453f5de:config.toml:generic-api-key:2
+a8b3b24d59b73d03adfa9f13d3e9d1c5d60383f5:config.toml:generic-api-key:2
+feedb912255b8f289981e2401dcb3a1ab287f4b7:config.toml:generic-api-key:2
+3f4b37be172a6358022d7a79e67aa06b3b92148c:config.toml:generic-api-key:2
+
+# ── authStore.ts: false positives ────────────────────────────────────────────
+#
+# WEBUITOKEN and ACCESS_TOKEN_KEY are localStorage key *names* — fixed hex
+# strings used to namespace browser storage, not credentials. They are compiled
+# into the public JS bundle by design and grant nothing. The generic-api-key
+# rule matches them only on entropy.
+4af5176b65d769d6efb12f5761c9f890855c87ff:web/src/stores/authStore.ts:generic-api-key:22
+1a8f95117e91078f1cfaa8e584c58a21e687c926:web/src/stores/authStore.ts:generic-api-key:20

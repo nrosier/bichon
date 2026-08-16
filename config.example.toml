@@ -1,0 +1,14 @@
+# Configuration for bichon-cli. Copy to config.toml and fill in your own values:
+#
+#   cp config.example.toml config.toml
+#
+# config.toml is gitignored because api_token below is a real access token — the
+# CLI sends it as `Authorization: Bearer <api_token>`. Never commit it. Running
+# bichon-cli with no config.toml will also prompt for these values and write the
+# file for you.
+
+# Where your Bichon server is reachable.
+base_url = "http://localhost:15630"
+
+# Create one in the web UI under Settings > Access Tokens.
+api_token = "paste-your-access-token-here"

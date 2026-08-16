@@ -85,9 +85,11 @@ jobs:
           override: true
 
       - name: Setup Node.js & pnpm
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
-          node-version: 20
+          # Must stay >= 22.13: that is pnpm 11's declared engine floor, and the
+          # install below fails outright on anything older.
+          node-version: 24
 
       - name: Install pnpm
         # Pinned: pnpm 11 turned pending dependency build scripts into a hard
