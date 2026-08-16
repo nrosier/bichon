@@ -149,7 +149,10 @@ pub struct IdTokenClaims {
     pub azp: Option<String>,
     #[serde(default)]
     pub email: Option<String>,
-    #[serde(default)]
+    /// Whether the provider vouches for the address in `email`. Consulted by
+    /// [`crate::oidc::user`] before an email is allowed to adopt an existing
+    /// account.
+    #[serde(default, deserialize_with = "lenient_bool")]
     pub email_verified: Option<bool>,
     #[serde(default)]
     pub name: Option<String>,
@@ -158,6 +161,39 @@ pub struct IdTokenClaims {
     /// Session id, used for RP-initiated logout when the provider supplies it.
     #[serde(default)]
     pub sid: Option<String>,
+}
+
+/// Deserialise a claim that ought to be a boolean but is not always one.
+///
+/// `email_verified` is specified as a boolean, yet providers have shipped it as
+/// the string `"true"` for years. A plain `Option<bool>` would make such a token
+/// fail to parse — turning a cosmetic provider quirk into a login that cannot
+/// happen at all — so a string is read and anything else becomes `None`.
+///
+/// `None` means "the provider said nothing usable", which every caller must treat
+/// as *not* verified. Being lenient about the shape is safe only because being
+/// strict about the meaning happens elsewhere.
+pub(crate) fn lenient_bool<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<bool>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Bool(bool),
+        Text(String),
+        /// Numbers, objects, arrays: accepted rather than rejected, then dropped.
+        Other(serde::de::IgnoredAny),
+    }
+
+    Ok(match Option::<Raw>::deserialize(deserializer)? {
+        None | Some(Raw::Other(_)) => None,
+        Some(Raw::Bool(value)) => Some(value),
+        Some(Raw::Text(text)) => match text.trim().to_ascii_lowercase().as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+    })
 }
 
 /// Verify an ID token end to end.
@@ -487,6 +523,7 @@ mod tests {
             redirect_uri: "https://mail.example.com/api/auth/oidc/callback".into(),
             default_role_id: 100_200_000_000_000,
             auto_redirect: false,
+            link_by_email: false,
         }
     }
 
@@ -754,6 +791,45 @@ mod tests {
 
         let too_long = URL_SAFE_NO_PAD.encode([0u8; 33]);
         assert!(coordinate(&too_long, "x").is_err());
+    }
+
+    #[test]
+    fn email_verified_reads_the_shapes_providers_actually_send() {
+        for (raw, expected) in [
+            ("true", Some(true)),
+            ("false", Some(false)),
+            // The long-standing quirk this leniency exists for.
+            ("\"true\"", Some(true)),
+            ("\"false\"", Some(false)),
+            ("\"TRUE\"", Some(true)),
+            ("\" true \"", Some(true)),
+        ] {
+            let claims = claims_with_email_verified(raw);
+            assert_eq!(claims.email_verified, expected, "{}", raw);
+        }
+    }
+
+    #[test]
+    fn email_verified_treats_anything_else_as_no_answer() {
+        // None is not "verified": `oidc::user` requires Some(true) exactly. What
+        // matters here is that none of these fail the whole token parse, which
+        // would break the login rather than just the linking decision.
+        for raw in ["null", "1", "0", "\"yes\"", "\"\"", "{}", "[]", "1.5"] {
+            let claims = claims_with_email_verified(raw);
+            assert_eq!(claims.email_verified, None, "{}", raw);
+        }
+    }
+
+    #[test]
+    fn email_verified_is_absent_without_complaint() {
+        let claims: IdTokenClaims = serde_json::from_value(valid_claims()).unwrap();
+        assert_eq!(claims.email_verified, None);
+    }
+
+    fn claims_with_email_verified(raw: &str) -> IdTokenClaims {
+        let mut claims = valid_claims();
+        claims["email_verified"] = serde_json::from_str(raw).expect("test fixture must be JSON");
+        serde_json::from_value(claims).unwrap_or_else(|e| panic!("{} failed to parse: {}", raw, e))
     }
 
     #[test]

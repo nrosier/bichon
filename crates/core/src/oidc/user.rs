@@ -24,6 +24,7 @@ use crate::database::manager::DB_MANAGER;
 use crate::database::{filter_impl, insert_impl, update_impl};
 use crate::error::code::ErrorCode;
 use crate::error::BichonResult;
+use crate::oidc::config::OidcConfig;
 use crate::oidc::SSO_PROVIDER;
 use crate::users::role::{UserRole, DEFAULT_MEMBER_ROLE_ID};
 use crate::users::UserModel;
@@ -40,6 +41,10 @@ pub struct SsoIdentity {
     /// The `sub` claim: stable and unique within the issuer.
     pub subject: String,
     pub email: Option<String>,
+    /// Whether the provider vouches for `email`, from the claim of the same name
+    /// alongside whichever source `email` came from. `None` means the provider
+    /// said nothing, which counts as not verified.
+    pub email_verified: Option<bool>,
     pub preferred_username: Option<String>,
     pub name: Option<String>,
 }
@@ -58,11 +63,12 @@ pub enum Resolution {
 
 /// Find the user behind a verified identity, creating one if necessary.
 ///
-/// Lookup order (README, "User resolution"): `(sso_provider, sso_id)`, then
-/// `email`, then auto-provision with the configured default role.
+/// Lookup order (`docs/OIDC.md`, "User resolution"): `(sso_provider, sso_id)`,
+/// then `email` if linking is enabled, then auto-provision with the configured
+/// default role.
 pub fn resolve_or_provision(
     identity: &SsoIdentity,
-    default_role_id: u64,
+    config: &OidcConfig,
 ) -> BichonResult<(UserModel, Resolution)> {
     let subject = identity.subject.clone();
     let existing = filter_impl::<UserModel, _>(DB_MANAGER.db(), move |u| {
@@ -74,13 +80,21 @@ pub fn resolve_or_provision(
 
     // Second chance: an account created locally (or by an earlier import) with
     // the same address. Linking it means the user keeps their roles and data
-    // instead of silently getting a second, empty account.
+    // instead of silently getting a second, empty account — but see
+    // `link_check` for why it has to be asked for.
     if let Some(email) = identity.email.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
         let needle = email.to_lowercase();
         let matches = filter_impl::<UserModel, _>(DB_MANAGER.db(), move |u| {
             u.email.to_lowercase() == needle
         })?;
         if let Some(user) = matches.into_iter().next() {
+            if let Some(refusal) = link_check(identity, config.link_by_email) {
+                warn!(
+                    "refusing to link the OIDC identity '{}' to existing user '{}' by email <{}>: {}",
+                    identity.subject, user.username, email, refusal.log
+                );
+                return Err(raise_error!(refusal.user_facing.into(), ErrorCode::PermissionDenied));
+            }
             let linked = link_to_sso(&user, &identity.subject)?;
             info!(
                 "linked existing user '{}' to the OIDC identity '{}'",
@@ -90,12 +104,59 @@ pub fn resolve_or_provision(
         }
     }
 
-    let user = provision(identity, default_role_id)?;
+    let user = provision(identity, config.default_role_id)?;
     info!(
         "provisioned user '{}' from the OIDC identity '{}'",
         user.username, identity.subject
     );
     Ok((user, Resolution::Provisioned))
+}
+
+/// Why a link was refused: one message for the operator, one for the browser.
+struct LinkRefusal {
+    log: &'static str,
+    /// Deliberately says nothing about the account that was matched. The person
+    /// reading it authenticated at the provider, not at Bichon, so naming the
+    /// Bichon username would confirm it exists to someone who has not proved
+    /// they own it.
+    user_facing: &'static str,
+}
+
+/// Whether a provider-asserted email may adopt an existing Bichon account.
+///
+/// Linking hands over that account's roles, ACLs and mailbox access on the
+/// strength of an email address, so it needs the provider to be authoritative
+/// about addresses. Many are not: anywhere a principal can self-register, or edit
+/// their own profile email without confirming it, someone can claim an address
+/// they do not own and inherit the Bichon account behind it. Two conditions have
+/// to hold, and neither is safe to infer.
+///
+/// A refusal fails the login rather than falling through to provisioning. A second
+/// account with the same address is confusing on its own, and it would bury the
+/// fact that a real account was nearly handed out.
+fn link_check(identity: &SsoIdentity, link_by_email: bool) -> Option<LinkRefusal> {
+    if !link_by_email {
+        return Some(LinkRefusal {
+            log: "BICHON_OIDC_LINK_BY_EMAIL is not enabled",
+            user_facing: "An account with this email address already exists in Bichon, and \
+                          linking accounts by email is switched off. An administrator can set \
+                          BICHON_OIDC_LINK_BY_EMAIL=true to allow it, or change the address on \
+                          the existing account so a separate one is created instead.",
+        });
+    }
+
+    if identity.email_verified != Some(true) {
+        return Some(LinkRefusal {
+            log: "the provider did not assert email_verified=true for the address",
+            user_facing: "An account with this email address already exists in Bichon, but the \
+                          identity provider does not confirm that this address has been verified, \
+                          so the two cannot be linked automatically. Have the address verified at \
+                          the provider, or change the address on the existing Bichon account so a \
+                          separate one is created instead.",
+        });
+    }
+
+    None
 }
 
 /// Stamp the SSO identity onto an existing user so the next login matches on

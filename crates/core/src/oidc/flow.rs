@@ -155,7 +155,7 @@ pub async fn complete(config: &OidcConfig, state: &str, code: &str) -> BichonRes
         jwt::verify_id_token(id_token, config, &metadata.jwks_uri, &pending.nonce).await?;
 
     let identity = build_identity(&claims, &metadata, &tokens.access_token).await;
-    let (user, resolution) = user::resolve_or_provision(&identity, config.default_role_id)?;
+    let (user, resolution) = user::resolve_or_provision(&identity, config)?;
     debug!(
         "OIDC login for '{}' resolved as {:?}",
         user.username, resolution
@@ -320,6 +320,7 @@ async fn build_identity(
     let mut identity = SsoIdentity {
         subject: claims.sub.clone(),
         email: claims.email.clone(),
+        email_verified: claims.email_verified,
         preferred_username: claims.preferred_username.clone(),
         name: claims.name.clone(),
     };
@@ -334,7 +335,10 @@ async fn build_identity(
 
     match fetch_userinfo(endpoint, access_token, &claims.sub).await {
         Ok(info) => {
+            // Both taken from userinfo together: a verification flag only says
+            // anything about the address it was published next to.
             identity.email = info.email;
+            identity.email_verified = info.email_verified;
             identity.preferred_username = identity.preferred_username.or(info.preferred_username);
             identity.name = identity.name.or(info.name);
         }
@@ -353,6 +357,8 @@ struct UserInfo {
     sub: String,
     #[serde(default)]
     email: Option<String>,
+    #[serde(default, deserialize_with = "jwt::lenient_bool")]
+    email_verified: Option<bool>,
     #[serde(default)]
     preferred_username: Option<String>,
     #[serde(default)]

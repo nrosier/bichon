@@ -10,6 +10,7 @@
 //! how a verified identity turns into a user, and how the SPA collects its
 //! access token.
 
+use bichon_core::oidc::config::OidcConfig;
 use bichon_core::oidc::store::{self, Handoff};
 use bichon_core::oidc::user::{resolve_or_provision, Resolution, SsoIdentity};
 use bichon_core::oidc::SSO_PROVIDER;
@@ -42,9 +43,33 @@ fn identity(tag: &str) -> SsoIdentity {
     SsoIdentity {
         subject: format!("subject-{tag}"),
         email: Some(format!("{tag}@oidc.example.com")),
+        // Only consulted when an email is about to adopt an existing account.
+        email_verified: Some(true),
         preferred_username: Some(format!("user-{tag}")),
         name: Some(format!("Test {tag}")),
     }
+}
+
+/// A config built directly, since `OidcConfig::load()` reads the environment the
+/// test binary happens to run in.
+fn config(link_by_email: bool) -> OidcConfig {
+    OidcConfig {
+        issuer_url: "https://idp.example.com".into(),
+        client_id: "bichon".into(),
+        client_secret: None,
+        redirect_uri: "https://mail.example.com/api/auth/oidc/callback".into(),
+        default_role_id: DEFAULT_MEMBER_ROLE_ID,
+        auto_redirect: false,
+        link_by_email,
+    }
+}
+
+/// The seeded admin: the local account an operator already has before turning
+/// SSO on, and so the one an email match would adopt.
+fn local_admin() -> UserModel {
+    UserModel::find(DEFAULT_ADMIN_USER_ID)
+        .expect("lookup should succeed")
+        .expect("the admin user exists after setup")
 }
 
 // ── User resolution ─────────────────────────────────────────────────────────
@@ -55,7 +80,7 @@ async fn unknown_identity_is_provisioned_with_the_default_role() {
 
     let identity = identity("provision");
     let (user, resolution) =
-        resolve_or_provision(&identity, DEFAULT_MEMBER_ROLE_ID).expect("provisioning should succeed");
+        resolve_or_provision(&identity, &config(false)).expect("provisioning should succeed");
 
     assert_eq!(resolution, Resolution::Provisioned);
     assert_eq!(user.sso_provider.as_deref(), Some(SSO_PROVIDER));
@@ -74,34 +99,32 @@ async fn a_second_login_matches_the_same_user() {
 
     let identity = identity("repeat");
     let (first, first_resolution) =
-        resolve_or_provision(&identity, DEFAULT_MEMBER_ROLE_ID).expect("first login should succeed");
+        resolve_or_provision(&identity, &config(false)).expect("first login should succeed");
     assert_eq!(first_resolution, Resolution::Provisioned);
 
     // Same subject, different profile claims: the match is on (provider, sub),
     // so this must find the existing account rather than create a second one.
+    // Nothing about the email — not even a missing verification flag — can get
+    // in the way once an identity is attached.
     let returning = SsoIdentity {
         subject: identity.subject.clone(),
         email: Some("renamed@oidc.example.com".into()),
+        email_verified: None,
         preferred_username: Some("renamed".into()),
         name: Some("Renamed".into()),
     };
     let (second, second_resolution) =
-        resolve_or_provision(&returning, DEFAULT_MEMBER_ROLE_ID).expect("second login should succeed");
+        resolve_or_provision(&returning, &config(false)).expect("second login should succeed");
 
     assert_eq!(second_resolution, Resolution::ExistingSsoUser);
     assert_eq!(second.id, first.id);
 }
 
 #[tokio::test]
-async fn an_existing_local_user_is_linked_by_email() {
+async fn an_existing_local_user_is_linked_by_email_when_asked_for() {
     setup().await;
 
-    // A local account the operator created before turning SSO on. `setup()`
-    // seeds the built-in admin, which is exactly that: a password user with no
-    // SSO identity.
-    let local = UserModel::find(DEFAULT_ADMIN_USER_ID)
-        .expect("lookup should succeed")
-        .expect("the admin user exists after setup");
+    let local = local_admin();
     assert!(
         local.sso_provider.is_none(),
         "the admin user should start without an SSO identity"
@@ -110,11 +133,12 @@ async fn an_existing_local_user_is_linked_by_email() {
     let identity = SsoIdentity {
         subject: "subject-link".into(),
         email: Some(local.email.to_uppercase()), // also checks case-insensitive matching
+        email_verified: Some(true),
         preferred_username: Some("admin-from-idp".into()),
         name: Some("Admin".into()),
     };
     let (linked, resolution) =
-        resolve_or_provision(&identity, DEFAULT_MEMBER_ROLE_ID).expect("linking should succeed");
+        resolve_or_provision(&identity, &config(true)).expect("linking should succeed");
 
     assert_eq!(resolution, Resolution::LinkedByEmail);
     assert_eq!(linked.id, local.id, "must adopt the account, not clone it");
@@ -123,6 +147,81 @@ async fn an_existing_local_user_is_linked_by_email() {
         linked.global_roles, local.global_roles,
         "linking must not change the roles the user already had"
     );
+}
+
+/// The default. Adopting an account on the strength of an email address hands
+/// over its roles and mailbox access, so it has to be switched on deliberately.
+#[tokio::test]
+async fn linking_is_refused_unless_it_is_switched_on() {
+    setup().await;
+
+    let identity = SsoIdentity {
+        subject: "subject-link-disabled".into(),
+        email: Some(local_admin().email),
+        email_verified: Some(true),
+        ..Default::default()
+    };
+
+    let error = resolve_or_provision(&identity, &config(false))
+        .expect_err("the login must fail rather than link or clone");
+    let message = error.to_string();
+    assert!(
+        message.contains("BICHON_OIDC_LINK_BY_EMAIL"),
+        "the operator has to learn which setting to flip: {}",
+        message
+    );
+
+    assert!(
+        no_user_has_subject("subject-link-disabled"),
+        "a refused link must not fall through to provisioning a second account"
+    );
+}
+
+/// A provider that will not say the address is verified is a provider whose
+/// users may have typed it themselves.
+#[tokio::test]
+async fn linking_is_refused_when_the_provider_does_not_vouch_for_the_email() {
+    setup().await;
+
+    let email = local_admin().email;
+    for (tag, email_verified) in [
+        ("subject-link-unverified", Some(false)),
+        // The provider published no such claim at all, which is not a promise.
+        ("subject-link-silent", None),
+    ] {
+        let identity = SsoIdentity {
+            subject: tag.into(),
+            email: Some(email.clone()),
+            email_verified,
+            ..Default::default()
+        };
+
+        let error = match resolve_or_provision(&identity, &config(true)) {
+            Err(e) => e.to_string(),
+            Ok((user, resolution)) => {
+                panic!("email_verified={email_verified:?} was {resolution:?} as '{}'", user.username)
+            }
+        };
+        assert!(
+            error.contains("verified"),
+            "the message should say what was missing: {}",
+            error
+        );
+        assert!(
+            no_user_has_subject(tag),
+            "a refused link must not fall through to provisioning a second account"
+        );
+    }
+}
+
+/// Whether any account carries this SSO subject, i.e. whether a login created or
+/// adopted one.
+fn no_user_has_subject(subject: &str) -> bool {
+    let subject = subject.to_owned();
+    UserModel::list_all()
+        .expect("listing users should succeed")
+        .into_iter()
+        .all(|u| u.sso_id.as_deref() != Some(subject.as_str()))
 }
 
 // ── Handoff redemption ──────────────────────────────────────────────────────

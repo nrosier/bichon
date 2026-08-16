@@ -250,7 +250,7 @@ All settings accept both CLI flags (`--bichon-http-port`) and environment variab
 
 ### Single Sign-On (OIDC)
 
-This fork adds OIDC single sign-on for the WebUI. Configuration, the seven
+This fork adds OIDC single sign-on for the WebUI. Configuration, the nine
 `BICHON_OIDC_*` variables, and the provider setup notes are in
 **[docs/OIDC.md](docs/OIDC.md)**.
 

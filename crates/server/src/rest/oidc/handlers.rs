@@ -99,18 +99,21 @@ pub struct CallbackParams {
 #[handler]
 pub async fn oidc_callback(Query(params): Query<CallbackParams>, req: &Request) -> Response {
     if let Some(error) = params.error.as_deref() {
-        let detail = params
-            .error_description
-            .as_deref()
-            .map(|d| format!("{}: {}", error, d))
-            .unwrap_or_else(|| error.to_string());
-        warn!("the identity provider declined the sign-in ({})", detail);
+        // Logged in full, shown as a fixed string. This endpoint is public and
+        // reachable without any valid `state`, so `error_description` is not
+        // necessarily the provider's words at all: anyone can send a victim
+        // `/api/auth/oidc/callback?error=x&error_description=<anything>` and,
+        // if it were echoed, have Bichon render their text in an error toast on
+        // Bichon's own origin — a ready-made phishing surface.
+        warn!(
+            "the identity provider declined the sign-in (error={:?}, description={:?})",
+            error, params.error_description
+        );
         return redirect_to_sign_in(&format!(
             "?oidc_error={}",
-            urlencoding::encode(&format!(
-                "The identity provider declined the sign-in ({}).",
-                detail
-            ))
+            urlencoding::encode(
+                "The identity provider declined the sign-in. Check the Bichon server log for what it reported."
+            )
         ));
     }
 

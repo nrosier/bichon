@@ -255,6 +255,7 @@ mod tests {
             redirect_uri: "https://mail.example.com/api/auth/oidc/callback".into(),
             default_role_id: 1,
             auto_redirect: false,
+            link_by_email: false,
         };
         assert_eq!(
             config.discovery_url(),
