@@ -182,8 +182,8 @@ jobs:
           # everyone pulling the default tag. Main gets its own moving tag plus
           # an immutable per-commit one.
           short="${GITHUB_SHA:0:12}"
-          docker tag "$IMAGE_NAME:candidate" "$repo:main"
-          docker tag "$IMAGE_NAME:candidate" "$repo:main-$short"
-          docker push "$repo:main"
-          docker push "$repo:main-$short"
-          echo "Pushed $repo:main and $repo:main-$short"
+          docker tag "$IMAGE_NAME:candidate" "$repo:latest"
+          docker tag "$IMAGE_NAME:candidate" "$repo:$short"
+          docker push "$repo:latest"
+          docker push "$repo:$short"
+          echo "Pushed $repo:latest and $repo:$short"
