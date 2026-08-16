@@ -565,7 +565,10 @@
     "ssoFailed": "單一登入失敗",
     "ssoHandoffFailed": "無法完成登入。",
     "ssoLogin": "使用 SSO 登入",
+    "ssoLoopBlocked": "單一登入返回時沒有建立工作階段，因此 Bichon 已停止重試。請在下方登入，或請管理員檢查 OIDC 重新導向 URI。",
+    "ssoOr": "或",
     "ssoRedirecting": "正在轉向身分提供者...",
+    "ssoUseLocal": "使用本機帳戶",
     "username": "使用者名稱",
     "welcome": "歡迎使用 Bichon",
     "youWillNeedToLogInAgain": "您將需要再次登入才能存取您的帳號。"

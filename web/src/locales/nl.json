@@ -565,7 +565,10 @@
     "ssoFailed": "Single sign-on mislukt",
     "ssoHandoffFailed": "De aanmelding kon niet worden voltooid.",
     "ssoLogin": "Aanmelden met SSO",
+    "ssoLoopBlocked": "Single sign-on kwam terug zonder sessie, daarom probeert Bichon het niet opnieuw. Meld u hieronder aan of vraag een beheerder om de OIDC-redirect-URI te controleren.",
+    "ssoOr": "of",
     "ssoRedirecting": "Doorverwijzen naar uw identiteitsprovider...",
+    "ssoUseLocal": "Lokaal account gebruiken",
     "username": "Gebruikersnaam",
     "welcome": "Welkom bij Bichon",
     "youWillNeedToLogInAgain": "U moet opnieuw inloggen om toegang te krijgen tot uw account."

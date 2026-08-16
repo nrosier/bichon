@@ -575,7 +575,10 @@
     "ssoFailed": "单点登录失败",
     "ssoHandoffFailed": "无法完成登录。",
     "ssoLogin": "使用 SSO 登录",
+    "ssoLoopBlocked": "单点登录返回时未创建会话，因此 Bichon 已停止重试。请在下方登录，或让管理员检查 OIDC 重定向 URI。",
+    "ssoOr": "或",
     "ssoRedirecting": "正在跳转到身份提供商...",
+    "ssoUseLocal": "使用本地账户",
     "username": "用户名",
     "welcome": "欢迎使用 Bichon",
     "youWillNeedToLogInAgain": "您需要重新登录才能访问您的账户。"

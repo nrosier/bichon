@@ -565,7 +565,10 @@
     "ssoFailed": "シングルサインオンに失敗しました",
     "ssoHandoffFailed": "サインインを完了できませんでした。",
     "ssoLogin": "SSO でサインイン",
+    "ssoLoopBlocked": "シングルサインオンがセッションなしで戻ったため、Bichon は再試行を停止しました。下からサインインするか、管理者に OIDC リダイレクト URI の確認を依頼してください。",
+    "ssoOr": "または",
     "ssoRedirecting": "ID プロバイダーにリダイレクトしています...",
+    "ssoUseLocal": "ローカルアカウントを使用",
     "username": "ユーザー名",
     "welcome": "Bichon へようこそ",
     "youWillNeedToLogInAgain": "アカウントにアクセスするには、再度ログインする必要があります。"

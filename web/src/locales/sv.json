@@ -565,7 +565,10 @@
     "ssoFailed": "Single sign-on misslyckades",
     "ssoHandoffFailed": "Inloggningen kunde inte slutföras.",
     "ssoLogin": "Logga in med SSO",
+    "ssoLoopBlocked": "Single sign-on kom tillbaka utan en session, så Bichon slutade försöka igen. Logga in nedan eller be en administratör att kontrollera OIDC-omdirigerings-URI:n.",
+    "ssoOr": "eller",
     "ssoRedirecting": "Omdirigerar till din identitetsleverantör...",
+    "ssoUseLocal": "Använd ett lokalt konto",
     "username": "Användarnamn",
     "welcome": "Välkommen till Bichon",
     "youWillNeedToLogInAgain": "Du måste logga in igen för att komma åt ditt konto."

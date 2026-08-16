@@ -565,7 +565,10 @@
     "ssoFailed": "Logowanie jednokrotne nie powiodło się",
     "ssoHandoffFailed": "Nie udało się ukończyć logowania.",
     "ssoLogin": "Zaloguj się przez SSO",
+    "ssoLoopBlocked": "Logowanie jednokrotne wróciło bez sesji, więc Bichon przestał ponawiać próby. Zaloguj się poniżej lub poproś administratora o sprawdzenie adresu URI przekierowania OIDC.",
+    "ssoOr": "lub",
     "ssoRedirecting": "Przekierowywanie do dostawcy tożsamości...",
+    "ssoUseLocal": "Użyj konta lokalnego",
     "username": "Nazwa",
     "welcome": "Witaj w Bichon",
     "youWillNeedToLogInAgain": "Musisz zalogować się ponownie, aby ponownie móc korzystać."

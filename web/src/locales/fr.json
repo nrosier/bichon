@@ -565,7 +565,10 @@
     "ssoFailed": "Échec de l'authentification unique",
     "ssoHandoffFailed": "La connexion n'a pas pu être finalisée.",
     "ssoLogin": "Se connecter avec SSO",
+    "ssoLoopBlocked": "L'authentification unique est revenue sans session, Bichon a donc arrêté de réessayer. Connectez-vous ci-dessous ou demandez à un administrateur de vérifier l'URI de redirection OIDC.",
+    "ssoOr": "ou",
     "ssoRedirecting": "Redirection vers votre fournisseur d'identité...",
+    "ssoUseLocal": "Utiliser un compte local",
     "username": "Nom d'utilisateur",
     "welcome": "Bienvenue sur Bichon",
     "youWillNeedToLogInAgain": "Vous devrez vous reconnecter pour accéder à votre compte."

@@ -565,7 +565,10 @@
     "ssoFailed": "Accesso SSO non riuscito",
     "ssoHandoffFailed": "Non è stato possibile completare l'accesso.",
     "ssoLogin": "Accedi con SSO",
+    "ssoLoopBlocked": "L'accesso SSO è tornato senza una sessione, quindi Bichon ha smesso di riprovare. Accedi qui sotto o chiedi a un amministratore di verificare l'URI di reindirizzamento OIDC.",
+    "ssoOr": "oppure",
     "ssoRedirecting": "Reindirizzamento al tuo provider di identità...",
+    "ssoUseLocal": "Usa un account locale",
     "username": "Nome utente",
     "welcome": "Benvenuto in Bichon",
     "youWillNeedToLogInAgain": "Dovrai accedere nuovamente per accedere al tuo account."

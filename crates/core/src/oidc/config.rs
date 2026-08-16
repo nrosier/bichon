@@ -16,10 +16,21 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use std::sync::Once;
+
+use tracing::warn;
+use url::Url;
+
 use crate::error::code::ErrorCode;
 use crate::error::BichonResult;
 use crate::raise_error;
 use crate::settings::cli::SETTINGS;
+
+/// Path the callback handler is mounted at, relative to `BICHON_BASE_URL`.
+///
+/// The provider must send the browser here, so this is also what a derived
+/// `redirect_uri` ends with and what a configured one is checked against.
+pub const CALLBACK_PATH: &str = "/api/auth/oidc/callback";
 
 /// The `BICHON_OIDC_*` settings after validation.
 ///
@@ -35,6 +46,8 @@ pub struct OidcConfig {
     /// Optional: public clients (PKCE only) have no secret. Required for
     /// HS256-signed ID tokens, since the secret *is* the verification key.
     pub client_secret: Option<String>,
+    /// Where the provider sends the browser back to. Defaults to the callback
+    /// endpoint on `BICHON_PUBLIC_URL` when `BICHON_OIDC_REDIRECT_URI` is unset.
     pub redirect_uri: String,
     /// Role granted to users auto-provisioned on first login.
     pub default_role_id: u64,
@@ -58,10 +71,20 @@ impl OidcConfig {
 
         let issuer_url = required(&SETTINGS.bichon_oidc_issuer_url, "BICHON_OIDC_ISSUER_URL")?;
         let client_id = required(&SETTINGS.bichon_oidc_client_id, "BICHON_OIDC_CLIENT_ID")?;
-        let redirect_uri = required(
-            &SETTINGS.bichon_oidc_redirect_uri,
-            "BICHON_OIDC_REDIRECT_URI",
-        )?;
+
+        let expected_path = callback_path(&SETTINGS.bichon_base_url);
+        // Derived rather than required: the callback lives at a fixed path, so
+        // the public URL is enough to name it. An operator only has to set
+        // BICHON_OIDC_REDIRECT_URI when Bichon is reached under some other name.
+        let redirect_uri = match optional(&SETTINGS.bichon_oidc_redirect_uri) {
+            Some(configured) => configured,
+            None => format!(
+                "{}{}",
+                SETTINGS.bichon_public_url.trim_end_matches('/'),
+                expected_path
+            ),
+        };
+        check_redirect_uri(&redirect_uri, &expected_path)?;
 
         if !issuer_url.starts_with("https://") && !issuer_url.starts_with("http://") {
             return Err(raise_error!(
@@ -98,16 +121,124 @@ impl OidcConfig {
     }
 }
 
-fn required(value: &Option<String>, name: &str) -> BichonResult<String> {
+/// The callback path a browser must reach, including the configured UI base path.
+pub fn callback_path(base_url: &str) -> String {
+    format!("{}{}", base_url.trim_end_matches('/'), CALLBACK_PATH)
+}
+
+/// Reject a redirect URI a provider could not send a browser back to, and warn
+/// about one that does not name the callback endpoint.
+///
+/// Pointing it at the app root instead is the usual mistake, and it used to be
+/// invisible: the provider would drop the browser on the SPA with a `code` in
+/// the query, no session would come of it, and with `BICHON_OIDC_AUTO_REDIRECT`
+/// on the sign-in page would bounce back to the provider forever. The server
+/// forwards such a callback to the right endpoint, so this only warns — but the
+/// warning is the one place an operator learns the value is wrong.
+fn check_redirect_uri(value: &str, expected_path: &str) -> BichonResult<()> {
+    let url = Url::parse(value).map_err(|e| {
+        raise_error!(
+            format!(
+                "BICHON_OIDC_REDIRECT_URI must be an absolute URL, got '{}': {}.",
+                value, e
+            ),
+            ErrorCode::MissingConfiguration
+        )
+    })?;
+
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(raise_error!(
+            format!(
+                "BICHON_OIDC_REDIRECT_URI must be an http(s) URL, got '{}'.",
+                value
+            ),
+            ErrorCode::MissingConfiguration
+        ));
+    }
+
+    if url.path().trim_end_matches('/') != expected_path.trim_end_matches('/') {
+        // Once per process: OidcConfig::load() runs on every OIDC request.
+        static WARNED: Once = Once::new();
+        WARNED.call_once(|| {
+            warn!(
+                "BICHON_OIDC_REDIRECT_URI is '{}', which does not point at Bichon's OIDC callback. \
+                 Set it to '{}' (and register that value with the provider) so the sign-in lands \
+                 where Bichon can complete it.",
+                value,
+                format_args!(
+                    "{}{}",
+                    SETTINGS.bichon_public_url.trim_end_matches('/'),
+                    expected_path
+                )
+            );
+        });
+    }
+
+    Ok(())
+}
+
+/// A setting that is present and not blank.
+fn optional(value: &Option<String>) -> Option<String> {
     value
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
-        .ok_or_else(|| {
-            raise_error!(
-                format!("OIDC is enabled but {} is not set.", name),
-                ErrorCode::MissingConfiguration
-            )
-        })
+}
+
+fn required(value: &Option<String>, name: &str) -> BichonResult<String> {
+    optional(value).ok_or_else(|| {
+        raise_error!(
+            format!("OIDC is enabled but {} is not set.", name),
+            ErrorCode::MissingConfiguration
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn callback_path_follows_the_ui_base_path() {
+        assert_eq!(callback_path("/"), "/api/auth/oidc/callback");
+        assert_eq!(callback_path("/bichon"), "/bichon/api/auth/oidc/callback");
+        assert_eq!(callback_path("/bichon/"), "/bichon/api/auth/oidc/callback");
+    }
+
+    #[test]
+    fn check_redirect_uri_accepts_the_callback_endpoint() {
+        assert!(check_redirect_uri(
+            "https://mail.example.com/api/auth/oidc/callback",
+            &callback_path("/")
+        )
+        .is_ok());
+        assert!(check_redirect_uri(
+            "https://mail.example.com/bichon/api/auth/oidc/callback",
+            &callback_path("/bichon")
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn check_redirect_uri_tolerates_a_different_path() {
+        // Warns rather than fails: the server forwards these to the callback.
+        assert!(check_redirect_uri("https://mail.example.com/", &callback_path("/")).is_ok());
+    }
+
+    #[test]
+    fn check_redirect_uri_rejects_what_a_browser_cannot_follow() {
+        for hostile in [
+            "/api/auth/oidc/callback",
+            "mail.example.com/api/auth/oidc/callback",
+            "javascript:alert(1)",
+            "",
+        ] {
+            assert!(
+                check_redirect_uri(hostile, &callback_path("/")).is_err(),
+                "accepted {:?}",
+                hostile
+            );
+        }
+    }
 }

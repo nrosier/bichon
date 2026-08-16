@@ -260,9 +260,15 @@ Code flow with PKCE.
 | `BICHON_OIDC_ISSUER_URL` | — | Issuer URL. Bichon appends `/.well-known/openid-configuration` for discovery. Example: `https://auth.example.com/application/o/bichon/` |
 | `BICHON_OIDC_CLIENT_ID` | — | OAuth2 client ID registered with the IdP |
 | `BICHON_OIDC_CLIENT_SECRET` | — | OAuth2 client secret registered with the IdP |
-| `BICHON_OIDC_REDIRECT_URI` | — | Redirect URI registered with the IdP. Must resolve to `<public-url>/api/auth/oidc/callback` |
+| `BICHON_OIDC_REDIRECT_URI` | `<BICHON_PUBLIC_URL><BICHON_BASE_URL>/api/auth/oidc/callback` | Redirect URI registered with the IdP. Only needed when that derived value is not how the browser reaches Bichon |
 | `BICHON_OIDC_DEFAULT_ROLE_ID` | `100200000000000` (Member) | Global role ID assigned to auto-provisioned OIDC users |
-| `BICHON_OIDC_AUTO_REDIRECT` | `false` | When true, `/sign-in` immediately redirects to the IdP. Local login stays reachable via `/sign-in?local=1` |
+| `BICHON_OIDC_AUTO_REDIRECT` | `false` | When true, `/sign-in` skips the choice and goes straight to the IdP. Local login stays reachable via `/sign-in?local=1` |
+
+**Sign-in page.** With SSO enabled the sign-in page offers both ways in: the
+username/password form and a *Sign in with SSO* button, so local accounts keep
+working alongside provider accounts. Set `BICHON_OIDC_AUTO_REDIRECT=true` only
+if you want to skip that choice; the form then stays reachable at
+`/sign-in?local=1`, and the redirect screen offers the same escape hatch.
 
 **User resolution.** On each login Bichon looks up the user by
 `(sso_provider, sso_id)` first, then by `email`, and finally auto-provisions
@@ -286,10 +292,18 @@ placed in the URL, so it does not leak into browser history, `Referer`
 headers, or server access logs.
 
 > [!IMPORTANT]
-> Set `BICHON_OIDC_REDIRECT_URI` to the exact value you registered with the
-> IdP (including scheme, host, port, and path). The IdP rejects mismatched
-> callbacks. Behind a reverse proxy this must be the externally-reachable
-> URL, not `http://localhost:15630`.
+> `BICHON_OIDC_REDIRECT_URI` and the redirect URI registered with the IdP must
+> be the exact same value (including scheme, host, port, and path), and both
+> must name Bichon's callback endpoint: `<public-url>/api/auth/oidc/callback`,
+> prefixed with `BICHON_BASE_URL` when the UI is served under a sub-path.
+> Behind a reverse proxy this is the externally-reachable URL, not
+> `http://localhost:15630`.
+>
+> Registering the app root (`https://bichon.example.com/`) instead is the common
+> mistake: the provider then drops the browser on the WebUI with `?code=…` in
+> the query and no session ever gets created. Bichon forwards such a callback to
+> the right endpoint and logs a warning naming the value to fix, so sign-in still
+> works — but the mismatch is worth correcting.
 
 ### SMTP Server
 
