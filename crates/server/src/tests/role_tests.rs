@@ -52,9 +52,21 @@ async fn role_crud() {
     resp.assert_status_is_ok();
     let roles: Vec<UserRole> = resp.json().await.value().deserialize();
     assert!(roles.len() >= 5, "should have at least 5 built-in roles");
-    assert!(roles.iter().any(|r| r.name == "admin"));
     assert!(roles.iter().any(|r| r.name == "manager"));
     assert!(roles.iter().any(|r| r.name == "member"));
+
+    let admin = roles
+        .iter()
+        .find(|r| r.name == "admin")
+        .expect("admin is a built-in role");
+    assert!(
+        !admin.permissions.is_empty(),
+        "the admin role should carry permissions"
+    );
+    assert!(
+        !admin.role_type.is_empty(),
+        "every role should report a role_type"
+    );
 
     // Create custom role
     let mut perms = BTreeSet::new();

@@ -23,10 +23,30 @@ use crate::{
     {account::entity::Encryption, imap::client::Client},
 };
 
+/// Reads a developer-supplied .eml for the diagnostics below.
+///
+/// They were originally written against files in one contributor's Downloads
+/// folder, which no other machine has. Taking the path from the environment lets
+/// them run anywhere; they stay `#[ignore]`d because the fixture is not in the
+/// repository, so there is nothing for CI to point them at.
+fn eml_from_env(var: &str) -> Vec<u8> {
+    let path = std::env::var_os(var)
+        .unwrap_or_else(|| panic!("set {var} to the path of an .eml file to run this diagnostic"));
+    std::fs::read(&path).unwrap_or_else(|e| {
+        panic!(
+            "failed to read {}: {e}",
+            std::path::Path::new(&path).display()
+        )
+    })
+}
+
 #[tokio::test]
+#[ignore = "requires real IMAP credentials"]
 async fn testxx() {
-    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider())
-        .unwrap();
+    // Ignore a duplicate install: production code or another live test in this
+    // binary may have got there first, and `.unwrap()` would panic on the
+    // second caller. Matches the live tests in cache::imap::download::flow.
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
     let client = Client::connection("imap.zoho.com".into(), &Encryption::Ssl, 993, None, false)
         .await
         .unwrap();
@@ -37,9 +57,9 @@ async fn testxx() {
 }
 
 #[tokio::test]
+#[ignore = "diagnostic: set BICHON_TEST_EML to an .eml file"]
 async fn test1() {
-    let path = r"C:\Users\polly\Downloads\test.eml";
-    let eml_data = std::fs::read(path).unwrap();
+    let eml_data = eml_from_env("BICHON_TEST_EML");
     let input = base64_encode_url_safe!(eml_data);
     let message = MessageParser::default().parse(&input).unwrap();
     let parts = message.parts;
@@ -106,10 +126,13 @@ R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7
     //println!("{}", message.subject().unwrap());
 }
 
+// Exercises mail_parser's attachment offsets rather than Bichon's own stripping;
+// the production path is `detach_attachments` in envelope::extractor, whose
+// offset handling is covered hermetically by `detach_attachments_bounds_check`.
 #[tokio::test]
+#[ignore = "diagnostic: set BICHON_TEST_EML_ATTACHMENTS to an .eml file with attachments"]
 async fn test_bulk_attachment_stripping_blake3() {
-    let path = r"C:\Users\polly\Downloads\test666.eml";
-    let input = std::fs::read(path).expect("Failed to read EML file");
+    let input = eml_from_env("BICHON_TEST_EML_ATTACHMENTS");
 
     // 1. Initial Parse
     let message = MessageParser::default()
@@ -160,9 +183,10 @@ async fn test_bulk_attachment_stripping_blake3() {
         );
     }
 
-    std::fs::write("test.eml", &modified_eml).unwrap();
-
     // 4. Final Verification
+    // The rewritten message is verified from memory below; it used to also be
+    // written to ./test.eml, which just littered whatever directory cargo was
+    // invoked from.
     let final_message = MessageParser::default().parse(&modified_eml).unwrap();
 
     println!("\n--- Verification Report ---");
@@ -181,9 +205,9 @@ async fn test_bulk_attachment_stripping_blake3() {
 }
 
 #[tokio::test]
+#[ignore = "diagnostic: set BICHON_TEST_EML_ATTACHMENTS to an .eml file with attachments"]
 async fn test_667() {
-    let path = r"C:\Users\polly\Downloads\test777.eml";
-    let input = std::fs::read(path).expect("Failed to read EML file");
+    let input = eml_from_env("BICHON_TEST_EML_ATTACHMENTS");
 
     let message = MessageParser::default()
         .parse(&input)

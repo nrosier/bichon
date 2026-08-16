@@ -60,6 +60,7 @@ async fn user_crud() {
     resp.assert_status_is_ok();
     let user: UserView = resp.json().await.value().deserialize();
     assert_eq!(user.username, "testuser1");
+    assert_eq!(user.email, "testuser1@example.com");
     let user_id = user.id;
 
     // List users

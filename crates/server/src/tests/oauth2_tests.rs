@@ -77,6 +77,10 @@ async fn oauth2_crud() {
         .send()
         .await;
     resp.assert_status_is_ok();
+    let config: OAuth2Config = resp.json().await.value().deserialize();
+    assert_eq!(config.id, id);
+    assert_eq!(config.client_id, "test-client-id");
+    assert!(!config.enabled, "the config was created disabled");
 
     // Update
     let update = UpdateOAuth2Payload {

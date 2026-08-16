@@ -22,7 +22,17 @@ use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::transport::smtp::client::{Tls, TlsParameters};
 use lettre::{Message, SmtpTransport, Transport};
 
+// Both tests below drive a real SMTP conversation against a Bichon server on
+// 127.0.0.1:2525, with a configured account matching the envelope recipient.
+// They are integration tests, not unit tests: without that server they fail
+// with ConnectionRefused, which is a missing environment rather than a defect.
+// Ignored by default and run deliberately, matching the convention used for the
+// live-IMAP tests in bichon-core:
+//
+//   cargo test -p bichon-smtp -- --ignored --nocapture
+
 #[tokio::test]
+#[ignore = "requires a running Bichon SMTP server on 127.0.0.1:2525"]
 async fn test_smtp_archiving_flow() {
     let email = Message::builder()
         .from("tester@bichon.local".parse().unwrap())
@@ -50,6 +60,7 @@ async fn test_smtp_archiving_flow() {
 }
 
 #[test]
+#[ignore = "requires a running Bichon SMTP server on 127.0.0.1:2525 with STARTTLS and the test_user credentials"]
 fn test_bichon_smtp_logic() -> Result<(), Box<dyn Error>> {
     let smtp_host = "127.0.0.1";
     let smtp_port = 2525;

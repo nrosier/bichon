@@ -53,6 +53,10 @@ async fn proxy_crud() {
         .send()
         .await;
     resp.assert_status_is_ok();
+    // The list and the by-id lookup have to agree about the same proxy.
+    let fetched: Proxy = resp.json().await.value().deserialize();
+    assert_eq!(fetched.id, proxy_id);
+    assert_eq!(fetched.url, proxies[0].url);
 
     // Update proxy
     let resp = cli

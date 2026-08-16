@@ -437,6 +437,26 @@ pub struct Settings {
 
 impl Settings {
     pub fn init() -> Self {
+        // A test binary has no operator to pass `--bichon-root-dir`, and the
+        // fallback below *exits the process* when it is missing — which aborts
+        // the whole test binary rather than failing one test, taking every
+        // other test in it down too. A pid-scoped temp dir keeps a bare
+        // `cargo test` working; an explicit value in the environment still
+        // wins, and the pid keeps concurrent cargo invocations off each
+        // other's data.
+        //
+        // `cfg!(test)` is true only while this crate itself is compiled as a
+        // test, so a release build cannot reach this and can never silently
+        // write its data to a temp directory. bichon-server's suite needs the
+        // same bootstrap and cannot inherit it from here — core is a plain
+        // dependency there, so `cfg!(test)` is false — so it sets the variable
+        // itself in crates/server/src/tests/mod.rs.
+        if cfg!(test) && std::env::var_os("BICHON_ROOT_DIR").is_none() {
+            let root =
+                std::env::temp_dir().join(format!("bichon-core-test-{}", std::process::id()));
+            std::env::set_var("BICHON_ROOT_DIR", &root);
+        }
+
         // `cargo test` passes test-filter names and flags (e.g. --nocapture)
         // as extra positional arguments.  Try the full argv first; if clap
         // rejects it, fall back to parsing with only the binary name so that

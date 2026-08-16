@@ -266,17 +266,8 @@ fn dedup_account(
             entries.len() - 1
         );
 
-        // eprintln!(
-        //     "DEBUG Phase2: key={_key:?} kept={} deleting={}",
-        //     entries[0].email_id,
-        //     entries.len() - 1
-        // );
         // Keep entries[0], soft-delete everything else via term query on f_id
         for entry in &entries[1..] {
-            eprintln!(
-                "DEBUG Phase2: delete_term f_id={:?} text=\"{}\"",
-                fields.f_id, &entry.email_id
-            );
             // Remove the duplicate email from the email index
             let email_term = Term::from_field_text(fields.f_id, &entry.email_id);
             email_writer.delete_term(email_term);
@@ -617,40 +608,44 @@ mod tests {
         .await;
     }
 
-    /// Inspects the production email index and reports duplicate counts.
+    /// Inspects an existing email index and reports duplicate counts.
     ///
     /// A "duplicate" is defined as two or more emails sharing the same
     /// (account_id, mailbox_id, content_hash) tuple.
     ///
-    /// This test is read-only — it does not modify the index.
+    /// This is a read-only diagnostic, not a test: it asserts nothing, so it is
+    /// `#[ignore]`d and reports to stdout rather than quietly passing in every
+    /// CI run. Point it at an index and run it deliberately:
+    ///
+    /// ```text
+    /// BICHON_INSPECT_INDEX=/path/to/bichon-indices/mail_metadata \
+    ///   cargo test -p bichon-core inspect_index_duplicates -- --ignored --nocapture
+    /// ```
     #[test]
-    fn inspect_production_duplicates() {
-        let index_path = r"E:\bichon-data\bichon-indices\mail_metadata";
-        let report_path = std::path::PathBuf::from(r"E:\bichon\dedup_report.txt");
+    #[ignore = "diagnostic: set BICHON_INSPECT_INDEX to the index directory to inspect"]
+    fn inspect_index_duplicates() {
+        // Read from the environment rather than a hardcoded path: the index
+        // lives wherever the operator put BICHON_MAIL_INDEX_DIR, which is
+        // machine-specific.
+        let index_path = std::path::PathBuf::from(
+            std::env::var_os("BICHON_INSPECT_INDEX").expect(
+                "set BICHON_INSPECT_INDEX to the mail_metadata index directory to inspect",
+            ),
+        );
+        let index_path = index_path.display();
 
         let mut report = String::new();
         let _ = writeln!(report, "opening index at {index_path}...");
 
-        let index = match Index::open_in_dir(index_path) {
-            Ok(idx) => {
-                let _ = writeln!(report, "index opened successfully");
-                idx
-            }
-            Err(e) => {
-                let _ = writeln!(report, "Failed to open index at {index_path}: {e}");
-                let _ = std::fs::write(&report_path, &report);
-                return;
-            }
-        };
+        // Explicitly requested, so a failure to open is a real failure and not
+        // something to swallow.
+        let index = Index::open_in_dir(index_path.to_string())
+            .unwrap_or_else(|e| panic!("failed to open index at {index_path}: {e}"));
+        let _ = writeln!(report, "index opened successfully");
 
-        let reader = match index.reader() {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = writeln!(report, "Failed to create reader: {e}");
-                let _ = std::fs::write(&report_path, &report);
-                return;
-            }
-        };
+        let reader = index
+            .reader()
+            .unwrap_or_else(|e| panic!("failed to create reader: {e}"));
 
         reader.reload().expect("reader reload failed");
         let searcher = reader.searcher();
@@ -738,7 +733,8 @@ mod tests {
             total_docs - total_duplicate_emails,
         );
 
-        std::fs::write(&report_path, &report).unwrap();
-        println!("report written to {}", report_path.display());
+        // Straight to stdout: the caller passes --nocapture to see it, and
+        // nothing is left behind on disk.
+        print!("{report}");
     }
 }

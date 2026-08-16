@@ -85,6 +85,11 @@ async fn account_crud() {
     resp.assert_status_is_ok();
     let account: AccountResp = resp.json().await.value().deserialize();
     assert_eq!(account.id, account_id);
+    assert_eq!(
+        account.account_name.as_deref(),
+        Some("CRUD Test Account"),
+        "read should return the name the account was created with"
+    );
 
     // ── List ────────────────────────────────────────────────────────────
     let resp = cli
@@ -93,6 +98,14 @@ async fn account_crud() {
         .send()
         .await;
     resp.assert_status_is_ok();
+    // Deserializing into the page shape is itself a check: it fails if the
+    // endpoint stops returning `items`/`total_items`, which the web UI pages on.
+    let page: DataPage<AccountResp> = resp.json().await.value().deserialize();
+    assert!(page.total_items >= 1, "the created account should be counted");
+    assert!(
+        page.items.iter().any(|a| a.id == account_id),
+        "the created account should appear in the list"
+    );
 
     // ── Update ──────────────────────────────────────────────────────────
     let update_payload = UpdateAccountPayload {
