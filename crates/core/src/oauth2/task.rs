@@ -20,7 +20,6 @@ use crate::{
     common::periodic::{PeriodicTask, TaskHandle},
     context::BichonTask,
     oauth2::pending::OAuth2PendingEntity,
-    oidc::store,
 };
 use std::time::Duration;
 
@@ -36,10 +35,6 @@ impl BichonTask for OAuth2CleanTask {
         let task = move |_: Option<u64>| {
             Box::pin(async move {
                 OAuth2PendingEntity::clean()?;
-                // Same concern for OIDC sign-ins: abandoned attempts and
-                // unredeemed handoffs. Expired entries are already ignored on
-                // read, so this only reclaims memory.
-                store::clean();
                 Ok(())
             })
         };

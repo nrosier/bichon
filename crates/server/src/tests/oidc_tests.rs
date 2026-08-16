@@ -18,7 +18,7 @@ use bichon_core::users::{UserModel, DEFAULT_ADMIN_USER_ID};
 use bichon_core::utc_now;
 use serde::Deserialize;
 
-use crate::rest::public::oidc::oidc_handoff;
+use crate::rest::oidc::handlers::oidc_handoff;
 use crate::tests::setup;
 
 /// Mirrors `HandoffResponse`, whose fields are private to the handler module.

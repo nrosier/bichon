@@ -28,15 +28,8 @@ struct FeaturesResponse {
 
 #[handler]
 pub async fn get_features() -> impl IntoResponse {
-    let mut features = Vec::new();
-    // Advertised only when OIDC is switched on and configured, so the SPA can
-    // show the SSO button without a second round trip.
-    if bichon_core::oidc::is_available() {
-        features.push("sso".to_string());
-    }
-
     Json(FeaturesResponse {
-        features,
+        features: crate::rest::oidc::advertised_features(),
         edition: "community",
         version: env!("CARGO_PKG_VERSION").to_string(),
     })

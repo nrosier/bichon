@@ -32,6 +32,9 @@ use crate::settings::cli::SETTINGS;
 /// `redirect_uri` ends with and what a configured one is checked against.
 pub const CALLBACK_PATH: &str = "/api/auth/oidc/callback";
 
+/// Built-in Member role, granted to auto-provisioned users by default.
+const DEFAULT_ROLE_ID: u64 = 100200000000000;
+
 /// The `BICHON_OIDC_*` settings after validation.
 ///
 /// Constructing one of these is the single place that decides whether OIDC is
@@ -110,8 +113,8 @@ impl OidcConfig {
             client_id,
             client_secret,
             redirect_uri,
-            default_role_id: SETTINGS.bichon_oidc_default_role_id,
-            auto_redirect: SETTINGS.bichon_oidc_auto_redirect,
+            default_role_id: default_role_id()?,
+            auto_redirect: auto_redirect()?,
         })
     }
 
@@ -195,9 +198,95 @@ fn required(value: &Option<String>, name: &str) -> BichonResult<String> {
     })
 }
 
+/// A setting read straight from the environment rather than from [`SETTINGS`].
+///
+/// The five `BICHON_OIDC_*` values above are fields of upstream's `Settings`
+/// struct. These two are this fork's own, and keeping them out of that struct
+/// keeps every OIDC change confined to this module — nothing to re-apply when
+/// the fork is resynced, and no clash should upstream ever add the same names.
+/// Reading the variable directly is what clap's `env` attribute would do anyway;
+/// the cost is that these two have no `--flag` form.
+fn env_var(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+}
+
+/// `BICHON_OIDC_DEFAULT_ROLE_ID`: role granted on first SSO login.
+fn default_role_id() -> BichonResult<u64> {
+    parse_role_id(env_var("BICHON_OIDC_DEFAULT_ROLE_ID").as_deref())
+}
+
+fn parse_role_id(raw: Option<&str>) -> BichonResult<u64> {
+    match raw {
+        None => Ok(DEFAULT_ROLE_ID),
+        Some(raw) => raw.parse().map_err(|e| {
+            raise_error!(
+                format!(
+                    "BICHON_OIDC_DEFAULT_ROLE_ID must be a role id, got '{}': {}.",
+                    raw, e
+                ),
+                ErrorCode::MissingConfiguration
+            )
+        }),
+    }
+}
+
+/// `BICHON_OIDC_AUTO_REDIRECT`: skip the sign-in page's choice of login.
+fn auto_redirect() -> BichonResult<bool> {
+    parse_auto_redirect(env_var("BICHON_OIDC_AUTO_REDIRECT").as_deref())
+}
+
+/// Accepts what clap accepts for a `bool`, so an operator moving the value
+/// between this fork and upstream's setting sees it behave the same. A typo is
+/// an error rather than a silent `false`: quietly ignoring it would turn
+/// `AUTO_REDIRECT=yes` into a sign-in page that never redirects, with nothing
+/// to explain why.
+fn parse_auto_redirect(raw: Option<&str>) -> BichonResult<bool> {
+    match raw {
+        None => Ok(false),
+        Some(raw) => match raw.to_ascii_lowercase().as_str() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            other => Err(raise_error!(
+                format!(
+                    "BICHON_OIDC_AUTO_REDIRECT must be 'true' or 'false', got '{}'.",
+                    other
+                ),
+                ErrorCode::MissingConfiguration
+            )),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fork_only_settings_fall_back_to_their_defaults() {
+        // Unset means "behave as before the setting existed", which is what an
+        // upstream resync leaves an existing deployment with.
+        assert_eq!(parse_role_id(None).unwrap(), DEFAULT_ROLE_ID);
+        assert!(!parse_auto_redirect(None).unwrap());
+    }
+
+    #[test]
+    fn fork_only_settings_parse_what_an_operator_writes() {
+        assert_eq!(parse_role_id(Some("100200000000001")).unwrap(), 100200000000001);
+        for (raw, expected) in [("true", true), ("TRUE", true), ("false", false)] {
+            assert_eq!(parse_auto_redirect(Some(raw)).unwrap(), expected, "{}", raw);
+        }
+    }
+
+    #[test]
+    fn fork_only_settings_reject_a_typo_rather_than_ignoring_it() {
+        assert!(parse_role_id(Some("member")).is_err());
+        for raw in ["yes", "1", "on"] {
+            assert!(parse_auto_redirect(Some(raw)).is_err(), "accepted {:?}", raw);
+        }
+    }
 
     #[test]
     fn callback_path_follows_the_ui_base_path() {

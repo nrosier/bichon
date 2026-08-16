@@ -21,9 +21,7 @@ import { useNavigate, useLocation } from '@tanstack/react-router'
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import { resetToken } from '@/stores/authStore'
 import { useTranslation } from 'react-i18next'
-import { useCurrentUser } from '@/hooks/use-current-user'
-import { useOidc } from '@/hooks/use-oidc'
-import { oidc_local_logout, oidc_logout_url } from '@/api/oidc/api'
+import { useSsoSignOut } from '@/sso'
 import { useState } from 'react'
 
 interface SignOutDialogProps {
@@ -35,18 +33,16 @@ export function SignOutDialog({ open, onOpenChange }: SignOutDialogProps) {
   const navigate = useNavigate()
   const location = useLocation()
   const { t } = useTranslation()
-  const { user } = useCurrentUser()
-  const { ssoEnabled } = useOidc()
+  const sso = useSsoSignOut()
   const [isLoading, setIsLoading] = useState(false)
 
-  const isSsoUser =
-    ssoEnabled && !!user?.sso_provider && user.sso_provider !== ''
+  const isSsoUser = sso.isSsoUser
 
   const goToSignIn = (currentPath: string) => {
     navigate({
+      to: '/sign-in',
       // `local=1` keeps the password form up instead of bouncing the user
       // straight back into the provider they just signed out of.
-      to: '/sign-in',
       search: { local: '1', redirect: currentPath },
       replace: true,
     })
@@ -63,15 +59,11 @@ export function SignOutDialog({ open, onOpenChange }: SignOutDialogProps) {
       return
     }
     setIsLoading(true)
-    // Only sign out of Bichon; keep the SSO session for one-click sign-in.
-    // This revokes the token server-side, so clearing local storage is no
-    // longer all that stands between a copied token and the API.
-    oidc_local_logout()
-      .catch(() => {})
-      .finally(() => {
-        setIsLoading(false)
-        localSignOut()
-      })
+    // Only sign out of bichon; keep the SSO session for one-click sign-in.
+    sso.localSignOut().finally(() => {
+      setIsLoading(false)
+      localSignOut()
+    })
   }
 
   return (
@@ -108,14 +100,7 @@ export function SignOutDialog({ open, onOpenChange }: SignOutDialogProps) {
             disabled={isLoading}
             onClick={() => {
               setIsLoading(true)
-              // Revoke here, because the navigation that follows cannot carry
-              // the Authorization header the server would need to do it.
-              oidc_local_logout()
-                .catch(() => {})
-                .finally(() => {
-                  resetToken()
-                  window.location.href = oidc_logout_url()
-                })
+              sso.fullSignOut()
             }}
           >
             {t('sign_out.full_sign_out', 'Sign out and end SSO session')}

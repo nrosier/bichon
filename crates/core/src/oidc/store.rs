@@ -77,15 +77,12 @@ static HANDOFF: LazyLock<DashMap<String, Handoff>> = LazyLock::new(DashMap::new)
 
 /// Record an authorization request, keyed by its `state` value.
 pub fn put_pending(state: String, pending: PendingAuth) -> BichonResult<()> {
+    sweep_pending();
     if PENDING.len() >= MAX_PENDING {
-        sweep_pending();
-        if PENDING.len() >= MAX_PENDING {
-            return Err(raise_error!(
-                "Too many sign-in attempts are in progress. Please try again in a few minutes."
-                    .into(),
-                ErrorCode::TooManyRequest
-            ));
-        }
+        return Err(raise_error!(
+            "Too many sign-in attempts are in progress. Please try again in a few minutes.".into(),
+            ErrorCode::TooManyRequest
+        ));
     }
     PENDING.insert(state, pending);
     Ok(())
@@ -105,14 +102,12 @@ pub fn take_pending(state: &str) -> Option<PendingAuth> {
 
 /// Park a minted session and return the id the SPA will redeem it with.
 pub fn put_handoff(id: String, handoff: Handoff) -> BichonResult<()> {
+    sweep_handoff();
     if HANDOFF.len() >= MAX_HANDOFF {
-        sweep_handoff();
-        if HANDOFF.len() >= MAX_HANDOFF {
-            return Err(raise_error!(
-                "Too many sign-ins are waiting to complete. Please try again in a moment.".into(),
-                ErrorCode::TooManyRequest
-            ));
-        }
+        return Err(raise_error!(
+            "Too many sign-ins are waiting to complete. Please try again in a moment.".into(),
+            ErrorCode::TooManyRequest
+        ));
     }
     HANDOFF.insert(id, handoff);
     Ok(())
@@ -127,8 +122,14 @@ pub fn take_handoff(id: &str) -> Option<Handoff> {
     Some(handoff)
 }
 
-/// Drop expired entries from both stores. Called by the periodic OAuth2 cleanup
-/// task, and opportunistically when a store reaches its cap.
+/// Drop expired entries from both stores.
+///
+/// Nothing schedules this: each `put_*` above sweeps its own store first, which
+/// is enough because that is the only way an entry is ever added. Reclaiming the
+/// memory needs no periodic task, so this fork adds no hook to one — expired
+/// entries are already ignored on read, so a sweep is housekeeping, not
+/// correctness. Both maps are bounded (4096 pending, 1024 handoffs) and a sign-in
+/// touches them once, so sweeping per insert costs nothing measurable.
 pub fn clean() {
     sweep_pending();
     sweep_handoff();

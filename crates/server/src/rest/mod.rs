@@ -37,24 +37,20 @@ use poem::listener::{Listener, TcpListener};
 use poem::middleware::{CatchPanic, Compression, Cors};
 use poem::{get, post, Endpoint, EndpointExt, Route, Server};
 use public::oauth2::oauth2_callback;
-use public::oidc::{
-    oidc_callback, oidc_config, oidc_handoff, oidc_local_logout, oidc_login, oidc_logout,
-};
 use std::collections::HashSet;
 use std::time::Duration;
 
 #[cfg(feature = "embed-web")]
 use {
     assets::FrontEndAssets,
-    bichon_core::oidc::config::callback_path,
     http::HeaderValue,
+    poem::{handler, endpoint::EmbeddedFilesEndpoint, IntoResponse},
     poem::middleware::SetHeader,
-    poem::web::Redirect,
-    poem::{endpoint::EmbeddedFilesEndpoint, handler, IntoResponse, Request, Response},
 };
 
 pub mod api;
 pub mod assets;
+pub mod oidc;
 pub mod public;
 
 pub type ApiResult<T, E = ApiErrorResponse> = std::result::Result<T, E>;
@@ -119,17 +115,11 @@ pub fn build_routes() -> impl Endpoint {
         .nest("/api/v1/features", get(get_features))
         .nest("/api/status", get(get_status))
         .nest("/api/login", post(login))
-        // Unauthenticated by design: this is how a browser without a token
-        // obtains one. Each handler does its own validation.
-        .nest("/api/auth/oidc/config", get(oidc_config))
-        .nest("/api/auth/oidc/login", get(oidc_login))
-        .nest("/api/auth/oidc/callback", get(oidc_callback))
-        .nest("/api/auth/oidc/handoff", post(oidc_handoff))
-        .nest("/api/auth/oidc/local-logout", post(oidc_local_logout))
-        .nest("/api/auth/oidc/logout", get(oidc_logout))
         .nest_no_strip("/api/v1", open_api_route);
 
+    let app_logic = oidc::attach(app_logic);
     let app_logic = add_web_assets(app_logic);
+    let app_logic = oidc::guard_stray_callbacks(app_logic);
 
     Route::new()
         .nest(&SETTINGS.bichon_base_url, app_logic)
@@ -160,50 +150,9 @@ fn add_web_assets(route: Route) -> Route {
     route
 }
 
-/// Whether a query string is an OAuth2/OIDC callback rather than an app URL.
-///
-/// `state` is what distinguishes it: it is present in every response the
-/// provider sends back, successful or not, and nothing in the SPA uses that name.
-#[cfg(feature = "embed-web")]
-fn looks_like_oidc_callback(query: &str) -> bool {
-    let names = query
-        .split('&')
-        .map(|pair| pair.split('=').next().unwrap_or_default());
-
-    let mut has_state = false;
-    let mut has_outcome = false;
-    for name in names {
-        match name {
-            "state" => has_state = true,
-            "code" | "error" => has_outcome = true,
-            _ => {}
-        }
-    }
-    has_state && has_outcome
-}
-
 #[cfg(feature = "embed-web")]
 #[handler]
-async fn serve_index_with_base(req: &Request) -> Response {
-    // A provider callback that lands on an SPA URL means BICHON_OIDC_REDIRECT_URI
-    // names something other than the callback endpoint — the app root being the
-    // usual mistake. Serving index.html would strand the browser on a page with
-    // no session, which bounces back to the sign-in page; with
-    // BICHON_OIDC_AUTO_REDIRECT on, that is an endless round trip to the
-    // provider. Forward it to the endpoint that can complete the sign-in instead.
-    let callback = callback_path(&SETTINGS.bichon_base_url);
-    if req.uri().path() != callback {
-        if let Some(query) = req.uri().query().filter(|q| looks_like_oidc_callback(q)) {
-            tracing::warn!(
-                "an OIDC callback arrived at '{}' instead of '{}'; forwarding it. \
-                 Check BICHON_OIDC_REDIRECT_URI and the redirect URI registered with the provider.",
-                req.uri().path(),
-                callback
-            );
-            return Redirect::temporary(format!("{}?{}", callback, query)).into_response();
-        }
-    }
-
+async fn serve_index_with_base() -> impl IntoResponse {
     let mut html =
         String::from_utf8_lossy(&FrontEndAssets::get("index.html").unwrap().data).to_string();
 
@@ -258,36 +207,4 @@ pub async fn start_http_server() -> BichonResult<()> {
     server
         .await
         .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))
-}
-
-#[cfg(all(test, feature = "embed-web"))]
-mod tests {
-    use super::looks_like_oidc_callback;
-
-    #[test]
-    fn recognises_a_provider_callback() {
-        assert!(looks_like_oidc_callback("code=abc&state=xyz"));
-        assert!(looks_like_oidc_callback("state=xyz&code=abc&iss=https%3A%2F%2Fidp"));
-        // A declined sign-in carries `error` where `code` would have been.
-        assert!(looks_like_oidc_callback("error=access_denied&state=xyz"));
-    }
-
-    #[test]
-    fn leaves_ordinary_app_urls_alone() {
-        for query in [
-            "",
-            "redirect=%2Fmailboxes",
-            // No `state`: a search for the word "code", not a callback.
-            "q=code",
-            "code=abc",
-            "state=xyz",
-            "oidc_handoff=abc",
-        ] {
-            assert!(
-                !looks_like_oidc_callback(query),
-                "treated {:?} as a callback",
-                query
-            );
-        }
-    }
 }

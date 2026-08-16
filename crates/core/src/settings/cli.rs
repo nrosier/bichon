@@ -373,26 +373,6 @@ pub struct Settings {
     #[clap(long, env, help = "OpenID Connect redirect URI")]
     pub bichon_oidc_redirect_uri: Option<String>,
 
-    /// Role granted to users auto-provisioned on their first SSO login.
-    /// Defaults to the built-in Member role.
-    #[clap(
-        long,
-        default_value = "100200000000000",
-        env,
-        help = "Role id assigned to users auto-provisioned on first OIDC login"
-    )]
-    pub bichon_oidc_default_role_id: u64,
-
-    /// When enabled, `/sign-in` immediately redirects to the IdP.
-    /// The local username/password form stays reachable at `/sign-in?local=1`.
-    #[clap(
-        long,
-        default_value = "false",
-        env,
-        help = "Redirect /sign-in straight to the OIDC provider (local login stays at /sign-in?local=1)"
-    )]
-    pub bichon_oidc_auto_redirect: bool,
-
     /// Maximum HTTP request body size in MB for file uploads (default: 1100 MB).
     /// Requests exceeding this limit are rejected at the framework level before
     /// the application reads the body, preventing memory exhaustion attacks.

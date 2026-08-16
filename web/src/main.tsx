@@ -37,49 +37,16 @@ import { ToastAction } from './components/ui/toast'
 import i18n from './i18n'
 
 
-/** Query parameters an interrupted OIDC round trip leaves behind in the URL. */
-const OIDC_URL_PARAMS = [
-  'code',
-  'state',
-  'session_state',
-  'iss',
-  'oidc_handoff',
-  'oidc_error',
-  'oidc_error_code',
-];
-
-/**
- * The in-app path to return to once the user has signed in.
- *
- * Two things are stripped. The base path, because router navigation adds it
- * back. And anything the OIDC round trip left in the query: sending the user
- * back to `/?code=...` hands a spent authorization code to a fresh page load,
- * which turns one failed single sign-on into a loop between Bichon and the
- * identity provider.
- */
-const postLoginTarget = (): string => {
-  const { pathname, search, hash } = router.history.location;
-  const params = new URLSearchParams(search);
-  OIDC_URL_PARAMS.forEach((name) => params.delete(name));
-
-  const base = basepath === '/' ? '' : basepath;
-  const path = (pathname.startsWith(base) ? pathname.slice(base.length) : pathname) || '/';
-  const query = params.toString();
-  return `${path}${query ? `?${query}` : ''}${hash}`;
-};
-
-/** True on the sign-in page itself, base path or not. */
-const onSignInPage = (): boolean =>
-  router.history.location.pathname.replace(/\/+$/, '').endsWith('/sign-in');
-
 const handleAxiosError = (error: any) => {
   if (!(error instanceof AxiosError)) return;
 
   switch (error.response?.status) {
     case 401:
       resetToken();
-      if (!onSignInPage()) {
-        router.navigate({ to: '/sign-in', search: { redirect: postLoginTarget() } });
+      const currentPath = router.history.location.pathname;
+      if (currentPath !== '/sign-in') {
+        const redirect = `${router.history.location.href}`;
+        router.navigate({ to: '/sign-in', search: { redirect } });
       }
       break;
     case 403:
@@ -151,9 +118,8 @@ const queryClient = new QueryClient({
 const basepath = (window as any).__BICHON_BASE__ || '/';
 console.log('Current Basepath:', basepath);
 
-// The OIDC callback arrives at /sign-in?oidc_handoff=<id>, and the sign-in page
-// trades that id for the access token over a POST — so nothing sensitive is in
-// the URL for this file to pick up.
+// Removed: a `?access_token=` reader that installed whatever a URL carried as
+// the session. See docs/OIDC.md; this fork's callback posts a one-shot id instead.
 
 // Create a new router instance
 const router = createRouter({

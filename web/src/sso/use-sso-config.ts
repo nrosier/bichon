@@ -17,7 +17,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import { useQuery } from '@tanstack/react-query'
-import { oidc_config } from '@/api/oidc/api'
+import { oidc_config } from './api'
 
 /**
  * Whether SSO is available on this server.
@@ -26,7 +26,7 @@ import { oidc_config } from '@/api/oidc/api'
  * no token yet. `isLoading` matters there: the page must not flash the password
  * form before it knows whether to redirect straight to the provider.
  */
-export function useOidc() {
+export function useSsoConfig() {
   const { data, isLoading } = useQuery({
     queryKey: ['oidc-config'],
     queryFn: oidc_config,
