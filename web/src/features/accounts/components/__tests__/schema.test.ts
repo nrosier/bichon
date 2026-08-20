@@ -18,6 +18,7 @@ const validAccountData = {
   use_dangerous: false,
   download_interval_min: 60,
   download_batch_size: 30,
+  max_email_size_bytes: 100 * 1024 * 1024,
   auto_download_new_mailboxes: true,
 }
 
@@ -208,6 +209,49 @@ describe('Account Form Schema', () => {
       const result = getAccountSchema(false, t).safeParse({
         ...validAccountData,
         download_batch_size: 200,
+      })
+      expect(result.success).toBe(true)
+    })
+  })
+
+  describe('max_email_size_bytes field', () => {
+    it('rejects value less than 1 MB', () => {
+      const result = getAccountSchema(false, t).safeParse({
+        ...validAccountData,
+        max_email_size_bytes: 512 * 1024,
+      })
+      expect(result.success).toBe(false)
+    })
+
+    it('rejects value greater than 100 MB', () => {
+      const result = getAccountSchema(false, t).safeParse({
+        ...validAccountData,
+        max_email_size_bytes: 101 * 1024 * 1024,
+      })
+      expect(result.success).toBe(false)
+    })
+
+    it('rejects a missing value', () => {
+      const withoutSize: Partial<typeof validAccountData> = {
+        ...validAccountData,
+      }
+      delete withoutSize.max_email_size_bytes
+      const result = getAccountSchema(false, t).safeParse(withoutSize)
+      expect(result.success).toBe(false)
+    })
+
+    it('accepts value of exactly 1 MB', () => {
+      const result = getAccountSchema(false, t).safeParse({
+        ...validAccountData,
+        max_email_size_bytes: 1 * 1024 * 1024,
+      })
+      expect(result.success).toBe(true)
+    })
+
+    it('accepts value of exactly 100 MB', () => {
+      const result = getAccountSchema(false, t).safeParse({
+        ...validAccountData,
+        max_email_size_bytes: 100 * 1024 * 1024,
       })
       expect(result.success).toBe(true)
     })
