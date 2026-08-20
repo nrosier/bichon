@@ -13,7 +13,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "2.0.1"
+version = "2.0.2"
 edition = "2021"
 # Matches the per-file headers: AGPL v3 "or (at your option) any later version".
 license = "AGPL-3.0-or-later"
