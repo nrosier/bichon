@@ -41,6 +41,12 @@
       "groupName": "web dependencies"
     },
     {
+      "matchManagers": ["npm"],
+      "matchUpdateTypes": ["major"],
+      "groupName": "web major updates",
+      "description": "npm majors were being bundled into the routine 'web dependencies' group and merged without review; PR #25 bundled 10 majors at once (@tanstack/react-table 8->9, @mui/x-tree-view 8->9, @mui/material 7->9, zod 3->4, tailwindcss 3->4, vite 6->8, typescript 5->7, vitest 4->5, eslint 9->10, react-resizable-panels/recharts/tailwind-merge/react-day-picker/globals/eslint-plugin-react-hooks) and broke tsc -b (see commit reverting web/package.json, and the docker.yml build failures it caused). Keep majors in their own group so a breaking one doesn't ride in silently with patches."
+    },
+    {
       "matchManagers": ["github-actions"],
       "groupName": "github actions"
     }
