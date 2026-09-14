@@ -55,6 +55,9 @@ jobs:
   rust:
     name: cargo audit and cargo deny
     runs-on: ubuntu-latest
+    env:
+      CARGO_AUDIT_VERSION: '0.22.2'
+      CARGO_DENY_VERSION: '0.20.2'
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
@@ -71,14 +74,19 @@ jobs:
           path: |
             ~/.cargo/bin/cargo-audit
             ~/.cargo/bin/cargo-deny
-          key: audit-tools-${{ runner.os }}-v1
+          # Pinned versions in the key: bumping CARGO_AUDIT_VERSION/
+          # CARGO_DENY_VERSION below invalidates the cache instead of
+          # silently keeping whatever binary happened to be cached first.
+          # A stale cargo-audit here previously failed to resolve Cargo.lock
+          # ("failed to find dependency: winnow 1.0.2") on every PR.
+          key: audit-tools-${{ runner.os }}-audit${{ env.CARGO_AUDIT_VERSION }}-deny${{ env.CARGO_DENY_VERSION }}
 
       - name: Install cargo-audit and cargo-deny
         run: |
           set -euo pipefail
           # --locked keeps the tools themselves reproducible.
-          command -v cargo-audit >/dev/null || cargo install cargo-audit --locked
-          command -v cargo-deny  >/dev/null || cargo install cargo-deny  --locked
+          command -v cargo-audit >/dev/null || cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" --locked
+          command -v cargo-deny  >/dev/null || cargo install cargo-deny  --version "$CARGO_DENY_VERSION"  --locked
 
       - name: cargo audit
         # Known vulnerabilities in the dependency tree, from the RustSec
