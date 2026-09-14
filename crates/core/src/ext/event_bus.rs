@@ -97,6 +97,23 @@ pub enum Event {
         user: String,
         ip: IpAddr,
     },
+    /// TOTP two-factor authentication was enabled for a user.
+    MfaEnabled {
+        user: String,
+        ip: Option<IpAddr>,
+    },
+    /// TOTP two-factor authentication was disabled for a user.
+    MfaDisabled {
+        user: String,
+        ip: Option<IpAddr>,
+    },
+    /// An administrator forcibly reset another user's TOTP two-factor
+    /// authentication (e.g. the user lost access to their authenticator).
+    MfaResetByAdmin {
+        admin: String,
+        target_user: String,
+        ip: Option<IpAddr>,
+    },
     UserCreated {
         created_by: String,
         new_user: String,
@@ -241,6 +258,109 @@ pub enum Event {
         user: String,
         email: String,
         edition: String,
+    },
+    /// Pro edition: admin updated the brand identity (company name / tagline / logo).
+    BrandingUpdated {
+        user: String,
+        company_name: Option<String>,
+        tagline: Option<String>,
+        logo_changed: bool,
+    },
+    /// Pro edition: admin started an integrity check (manual full verification).
+    IntegrityCheckStarted {
+        user: String,
+        run_id: String,
+        scope: String,
+        mode: String,
+    },
+    /// Pro edition: integrity check finished with a summary.
+    IntegrityCheckCompleted {
+        user: String,
+        run_id: String,
+        total: u64,
+        ok: u64,
+        failed: u64,
+    },
+    /// Pro edition: an in-flight integrity check was cancelled.
+    IntegrityCheckCancelled {
+        user: String,
+        run_id: String,
+        processed: u64,
+    },
+    /// Pro edition: an integrity report was downloaded (CSV).
+    IntegrityReportDownloaded {
+        user: String,
+        run_id: String,
+        report_type: String,
+    },
+    /// Pro edition: a user saved a search condition for reuse.
+    SavedSearchCreated {
+        user: String,
+        search_id: String,
+        kind: String,
+        name: String,
+    },
+    /// Pro edition: a saved search was renamed (conditions are immutable).
+    SavedSearchRenamed {
+        user: String,
+        search_id: String,
+        name: String,
+    },
+    /// Pro edition: a saved search was deleted.
+    SavedSearchDeleted {
+        user: String,
+        search_id: String,
+        name: String,
+    },
+    /// A batch export job was started from a saved search.
+    ExportStarted {
+        user: String,
+        export_id: String,
+        saved_search_id: String,
+        format: String,
+        account_count: u64,
+        email_count: u64,
+    },
+    /// A batch export job finished successfully.
+    ExportCompleted {
+        user: String,
+        export_id: String,
+        saved_search_id: String,
+        exported: u64,
+        failed: u64,
+        artifact_size: u64,
+        /// SHA-256 of the finished artifact, bound into the audit trail.
+        artifact_hash: Option<String>,
+    },
+    /// A finished export artifact was compliance-verified: the artifact's
+    /// SHA-256 was recomputed and matched, and per-message content hashes
+    /// were cross-checked against the live archive.
+    ExportVerified {
+        user: String,
+        export_id: String,
+        artifact_hash: Option<String>,
+        checked: u64,
+        matched: u64,
+        mismatched: u64,
+    },
+    /// A batch export job failed.
+    ExportFailed {
+        user: String,
+        export_id: String,
+        saved_search_id: String,
+        error: String,
+    },
+    /// A batch export job was cancelled by its owner.
+    ExportCancelled {
+        user: String,
+        export_id: String,
+    },
+    /// An export artifact was downloaded.
+    ExportDownloaded {
+        user: String,
+        export_id: String,
+        email_count: u64,
+        artifact_size: u64,
     },
 }
 

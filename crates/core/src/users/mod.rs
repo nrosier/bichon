@@ -21,7 +21,7 @@ use crate::{
         delete_impl, filter_impl, find_impl, list_all_impl, manager::DB_MANAGER, update_impl,
         with_transaction, MemDbModel,
     },
-    decrypt, encrypt,
+    decrypt,
     error::{code::ErrorCode, BichonResult},
     generate_token, id, raise_error,
     token::{AccessTokenModel, TokenType},
@@ -36,6 +36,11 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use subtle::ConstantTimeEq;
+use argon2::{
+    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
+};
 use tracing::warn;
 
 pub mod acl;
@@ -55,6 +60,12 @@ pub struct LoginResult {
     pub access_token: Option<String>,
     pub theme: Option<String>,
     pub language: Option<String>,
+    /// When true, the password step succeeded and a TOTP code is required.
+    #[serde(default)]
+    pub mfa_required: bool,
+    /// One-time challenge token for the MFA verification step.
+    #[serde(default)]
+    pub mfa_challenge: Option<String>,
 }
 
 pub const DEFAULT_ADMIN_USER_ID: u64 = 100000000000000;
@@ -92,6 +103,15 @@ pub struct BichonUserV2 {
     pub sso_id: Option<String>,
     /// SSO provider identifier: `"oidc"` or future `"saml"` / `"ldap"`.
     pub sso_provider: Option<String>,
+    /// TOTP two-factor secret (AES-256-GCM encrypted at rest).
+    #[serde(default)]
+    pub totp_secret: Option<String>,
+    /// Whether TOTP two-factor authentication is enabled for this user.
+    #[serde(default)]
+    pub totp_enabled: bool,
+    /// One-time recovery codes (argon2id hashes), shown only once at enrollment.
+    #[serde(default)]
+    pub totp_recovery_codes: Vec<String>,
 }
 
 impl MemDbModel for BichonUserV2 {
@@ -218,7 +238,7 @@ impl BichonUserV2 {
                 id: DEFAULT_ADMIN_USER_ID,
                 username: "admin".into(),
                 email: "placeholder@example.com".into(),
-                password: Some(encrypt!("admin@bichon")?),
+                password: Some(hash_login_password("admin@bichon")?),
 
                 // Use global_roles as defined in our new schema
                 global_roles: vec![DEFAULT_ADMIN_ROLE_ID],
@@ -235,6 +255,9 @@ impl BichonUserV2 {
                 language: None,
                 sso_id: None,
                 sso_provider: None,
+                totp_secret: None,
+                totp_enabled: false,
+                totp_recovery_codes: Vec::new(),
             };
 
             // 3. Generate and insert an initial access token for the first-time setup
@@ -283,6 +306,8 @@ impl BichonUserV2 {
                             access_token: None,
                             theme: None,
                             language: None,
+                            mfa_required: false,
+                            mfa_challenge: None,
                         });
                     }
                 }
@@ -290,9 +315,61 @@ impl BichonUserV2 {
         };
 
         match user.password.as_ref() {
-            Some(encrypted_password) => {
-                let decrypted = decrypt!(encrypted_password)?;
-                if password == decrypted {
+            Some(stored_password) => {
+                let is_argon2 = stored_password.starts_with("$argon2id$");
+                let password_ok = if is_argon2 {
+                    match PasswordHash::new(stored_password) {
+                        Ok(parsed_hash) => Argon2::default()
+                            .verify_password(password.as_bytes(), &parsed_hash)
+                            .is_ok(),
+                        Err(_) => false,
+                    }
+                } else {
+                    let decrypted = decrypt!(stored_password)?;
+                    bool::from(password.as_bytes().ct_eq(decrypted.as_bytes()))
+                };
+
+                if password_ok {
+                    if !is_argon2 {
+                        let id_string = user.id.to_string();
+                        match hash_login_password(&password) {
+                            Ok(hashed) => {
+                                if let Err(e) = update_impl::<UserModel>(
+                                    DB_MANAGER.db(),
+                                    &id_string,
+                                    move |current| {
+                                        let mut updated = current.clone();
+                                        updated.password = Some(hashed);
+                                        updated.updated_at = utc_now!();
+                                        Ok(updated)
+                                    },
+                                ) {
+                                    warn!(
+                                        "Login succeeded but failed to upgrade password storage for user '{}': {:#?}",
+                                        user.username, e
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Login succeeded but failed to hash password for user '{}': {:#?}",
+                                    user.username, e
+                                );
+                            }
+                        }
+                    }
+                    if user.totp_enabled {
+                        let challenge = AccessTokenModel::new_mfa_challenge(user.id)?;
+                        return Ok(LoginResult {
+                            success: true,
+                            error_message: None,
+                            access_token: None,
+                            theme: user.theme.clone(),
+                            language: user.language.clone(),
+                            mfa_required: true,
+                            mfa_challenge: Some(challenge),
+                        });
+                    }
                     let new_token = AccessTokenModel::reset_webui_token(user.id)?;
                     Ok(LoginResult {
                         success: true,
@@ -300,6 +377,8 @@ impl BichonUserV2 {
                         access_token: Some(new_token),
                         theme: user.theme,
                         language: user.language,
+                        mfa_required: false,
+                        mfa_challenge: None,
                     })
                 } else {
                     warn!(
@@ -312,6 +391,8 @@ impl BichonUserV2 {
                         access_token: None,
                         theme: None,
                         language: None,
+                        mfa_required: false,
+                        mfa_challenge: None,
                     })
                 }
             }
@@ -331,6 +412,8 @@ impl BichonUserV2 {
                     access_token: None,
                     theme: None,
                     language: None,
+                    mfa_required: false,
+                    mfa_challenge: None,
                 })
             }
         }
@@ -338,6 +421,100 @@ impl BichonUserV2 {
 
     pub fn find(user_id: u64) -> BichonResult<Option<UserModel>> {
         find_impl::<UserModel>(DB_MANAGER.db(), &user_id.to_string())
+    }
+
+    // ── TOTP two-factor authentication ─────────────────────────────
+
+    /// Store a new (encrypted) TOTP secret. Enrollment is only completed by
+    /// `enable_totp_with_recovery_codes` after the user proves the code works.
+    pub fn set_totp_secret(&self, secret: &str) -> BichonResult<()> {
+        let encrypted = crate::encrypt!(secret)?;
+        let id = self.id.to_string();
+        update_impl::<UserModel>(DB_MANAGER.db(), &id, move |current| {
+            let mut updated = current.clone();
+            updated.totp_secret = Some(encrypted);
+            updated.totp_enabled = false;
+            updated.updated_at = utc_now!();
+            Ok(updated)
+        })?;
+        Ok(())
+    }
+
+    /// Decrypt this user's TOTP secret (used during verification).
+    pub fn decrypted_totp_secret(&self) -> BichonResult<Option<String>> {
+        match &self.totp_secret {
+            Some(secret) => Ok(Some(decrypt!(secret)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Enable TOTP and generate a fresh set of one-time recovery codes.
+    /// Returns the plaintext recovery codes (shown to the user exactly once).
+    pub fn enable_totp_with_recovery_codes(&self) -> BichonResult<Vec<String>> {
+        let codes = crate::utils::totp::generate_recovery_codes();
+        let mut hashed = Vec::with_capacity(codes.len());
+        for code in &codes {
+            hashed.push(crate::utils::totp::hash_recovery_code(code)?);
+        }
+        let id = self.id.to_string();
+        update_impl::<UserModel>(DB_MANAGER.db(), &id, move |current| {
+            let mut updated = current.clone();
+            updated.totp_enabled = true;
+            updated.totp_recovery_codes = hashed;
+            updated.updated_at = utc_now!();
+            Ok(updated)
+        })?;
+        Ok(codes)
+    }
+
+    /// Disable TOTP and clear all MFA state.
+    pub fn disable_totp(&self) -> BichonResult<()> {
+        let id = self.id.to_string();
+        update_impl::<UserModel>(DB_MANAGER.db(), &id, move |current| {
+            let mut updated = current.clone();
+            updated.totp_enabled = false;
+            updated.totp_secret = None;
+            updated.totp_recovery_codes = Vec::new();
+            updated.updated_at = utc_now!();
+            Ok(updated)
+        })?;
+        Ok(())
+    }
+
+    /// Verify a TOTP code against this user's secret (no state change).
+    pub fn verify_totp_code(&self, code: &str, window: u8) -> BichonResult<bool> {
+        let Some(secret) = self.decrypted_totp_secret()? else {
+            return Ok(false);
+        };
+        Ok(crate::utils::totp::verify_code(&secret, code, window))
+    }
+
+    /// Verify a one-time recovery code; consumes it on success.
+    pub fn verify_recovery_code(&self, code: &str) -> BichonResult<bool> {
+        let normalized = crate::utils::totp::normalize_recovery_code(code);
+        if normalized.is_empty() {
+            return Ok(false);
+        }
+        let id = self.id.to_string();
+        for stored in &self.totp_recovery_codes {
+            if crate::utils::totp::verify_hashed_code(stored, &normalized)? {
+                let consumed = stored.clone();
+                let remaining: Vec<String> = self
+                    .totp_recovery_codes
+                    .iter()
+                    .filter(|s| **s != consumed)
+                    .cloned()
+                    .collect();
+                update_impl::<UserModel>(DB_MANAGER.db(), &id, move |current| {
+                    let mut updated = current.clone();
+                    updated.totp_recovery_codes = remaining;
+                    updated.updated_at = utc_now!();
+                    Ok(updated)
+                })?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn check_username_conflict(username: &str) -> BichonResult<()> {
@@ -374,7 +551,7 @@ impl BichonUserV2 {
         Self::check_username_conflict(&request.username)?;
         Self::check_email_conflict(&request.email)?;
 
-        let password_hash = Some(encrypt!(&request.password)?);
+        let password_hash = Some(hash_login_password(&request.password)?);
         let now = utc_now!();
 
         let user = UserModel {
@@ -393,6 +570,9 @@ impl BichonUserV2 {
             language: request.language,
             sso_id: None,
             sso_provider: None,
+            totp_secret: None,
+            totp_enabled: false,
+            totp_recovery_codes: Vec::new(),
         };
 
         let user_clone = user.clone();
@@ -455,6 +635,9 @@ impl BichonUserV2 {
                 Ok(txn)
             })?;
         }
+
+        // Remove edition-specific per-user data (e.g. Pro analytics views).
+        crate::ext::user_cleanup::run_cleanups(id);
 
         Ok(())
     }
@@ -526,7 +709,7 @@ impl BichonUserV2 {
                 updated.description = Some(desc);
             }
             if let Some(password) = request.password {
-                updated.password = Some(encrypt!(&password)?);
+                updated.password = Some(hash_login_password(&password)?);
             }
 
             if let Some(global_roles) = request.global_roles {
@@ -594,4 +777,17 @@ impl BichonUserV2 {
 
         Ok(())
     }
+}
+
+fn hash_login_password(password: &str) -> BichonResult<String> {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|hash| hash.to_string())
+        .map_err(|_| {
+            raise_error!(
+                "Failed to hash password.".into(),
+                ErrorCode::InternalError
+            )
+        })
 }

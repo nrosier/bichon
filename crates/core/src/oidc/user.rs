@@ -219,6 +219,9 @@ fn provision(identity: &SsoIdentity, default_role_id: u64) -> BichonResult<UserM
         language: None,
         sso_id: Some(identity.subject.clone()),
         sso_provider: Some(SSO_PROVIDER.to_string()),
+        totp_secret: None,
+        totp_enabled: false,
+        totp_recovery_codes: Vec::new(),
     };
 
     insert_impl(DB_MANAGER.db(), user.clone())?;
