@@ -299,7 +299,7 @@ importers:
         specifier: ^8.17.0
         version: 8.17.0(eslint@9.16.0(jiti@2.4.2)(supports-color@8.1.1))(supports-color@8.1.1)(typescript@5.7.2)
       vite:
-        specifier: ^6.4.3
+        specifier: ^6.0.11
         version: 6.4.3(@types/node@22.19.2)(jiti@2.4.2)(sass@1.89.2)(terser@5.43.1)(tsx@4.19.2)(yaml@2.6.0)
       vitest:
         specifier: ^4.1.7
