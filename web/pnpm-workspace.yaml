@@ -23,15 +23,15 @@ overrides:
   # Arbitrary file read, and path traversal via a previous source map.
   postcss: ^8.5.18
   # Three separate DoS advisories, one per release line present.
-  brace-expansion@1: ^1.1.12
-  brace-expansion@2: ^2.1.4
+  brace-expansion@1: ^5.0.0
+  brace-expansion@2: ^5.0.0
   # Command injection in the glob CLI.
-  glob@10: ^10.5.0
+  glob@10: ^13.0.0
   # Code injection via _.template.
   lodash: ^4.17.24
   # ReDoS in matchOne() and in nested extglobs (3.x is unaffected).
-  minimatch@9: ^9.0.7
+  minimatch@9: ^10.0.0
   # Non-secure generators can loop indefinitely.
   nanoid@3: ^6.0.0
   # Several host-confusion/SSRF/path-traversal advisories in URI parsing.
-  fast-uri@3: ^3.1.7
+  fast-uri@3: ^4.0.0
