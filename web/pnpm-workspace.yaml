@@ -32,4 +32,6 @@ overrides:
   # ReDoS in matchOne() and in nested extglobs (3.x is unaffected).
   minimatch@9: ^9.0.7
   # Non-secure generators can loop indefinitely.
-  nanoid@3: ^3.3.18
+  nanoid@3: ^6.0.0
+  # Several host-confusion/SSRF/path-traversal advisories in URI parsing.
+  fast-uri@3: ^3.1.7
