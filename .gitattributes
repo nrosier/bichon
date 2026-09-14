@@ -1,0 +1,8 @@
+# This fork's CI/CD pipeline (Docker Hub release, security scanning, etc.) is
+# maintained independently of upstream's. On `git merge upstream/main`, always
+# keep our version of these files instead of generating conflicts to resolve
+# by hand every time.
+#
+# The "ours" driver must be registered once per clone:
+#   git config merge.ours.driver true
+.github/workflows/** merge=ours
