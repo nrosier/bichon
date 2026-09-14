@@ -1,5 +1,5 @@
 # Use Debian bullseye-slim as the base image for newer OpenSSL
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 ARG CRATE_VERSION
 ARG TARGETARCH
 # Build provenance. Both default to empty so a plain `docker build` still works.
