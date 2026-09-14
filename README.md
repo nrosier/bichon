@@ -8,8 +8,8 @@
   <a href="https://github.com/rustmailer/bichon/stargazers">
     <img src="https://img.shields.io/github/stars/rustmailer/bichon?style=for-the-badge&color=gold&label=STARS" alt="GitHub Stars">
   </a>
-  <a href="https://hub.docker.com/r/rustmailer/bichon">
-    <img src="https://img.shields.io/docker/pulls/rustmailer/bichon?style=for-the-badge&color=2496ED&label=DOCKER%20PULLS" alt="Docker Pulls">
+  <a href="https://hub.docker.com/r/niqck/bichon">
+    <img src="https://img.shields.io/docker/pulls/niqck/bichon?style=for-the-badge&color=2496ED&label=DOCKER%20PULLS" alt="Docker Pulls">
   </a>
   <a href="https://docs.google.com/forms/d/e/1FAIpQLScOlwsiUMfyQPBCLW2MLkygdRmAutEgvXDYPzzvEGPz0HFPXQ/viewform">
     <img src="https://img.shields.io/badge/Roadmap-2026_Survey-blue?style=for-the-badge&logo=googleforms" alt="User Survey">
@@ -20,8 +20,8 @@
   <a href="https://github.com/rustmailer/bichon/releases">
     <img src="https://img.shields.io/github/v/release/rustmailer/bichon" alt="Release">
   </a>
-  <a href="https://hub.docker.com/r/rustmailer/bichon">
-    <img src="https://img.shields.io/docker/v/rustmailer/bichon?label=docker" alt="Docker">
+  <a href="https://hub.docker.com/r/niqck/bichon">
+    <img src="https://img.shields.io/docker/v/niqck/bichon?label=docker" alt="Docker">
   </a>
   <a href="LICENSE">
     <img src="https://img.shields.io/badge/license-AGPLv3-blue.svg" alt="License">
@@ -117,7 +117,7 @@
 
 ```bash
 # Pull the image
-docker pull rustmailer/bichon:latest
+docker pull niqck/bichon:latest
 
 # Create data directory
 mkdir -p ./bichon-data
@@ -130,7 +130,7 @@ docker run -d \
   --user 1000:1000 \
   -e BICHON_ROOT_DIR=/data \
   -e BICHON_ENCRYPT_PASSWORD=your-secure-password-here \
-  rustmailer/bichon:latest
+  niqck/bichon:latest
 ```
 
 Open **[http://localhost:15630](http://localhost:15630)** in your browser.
@@ -143,7 +143,7 @@ Open **[http://localhost:15630](http://localhost:15630)** in your browser.
 ```yaml
 services:
   bichon:
-    image: rustmailer/bichon:latest
+    image: niqck/bichon:latest
     container_name: bichon
     ports:
       - "15630:15630"
