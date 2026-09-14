@@ -12,6 +12,13 @@
       "groupName": "cargo dependencies"
     },
     {
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["reqwest", "argon2", "oauth2"],
+      "matchUpdateTypes": ["major"],
+      "groupName": "cargo security-sensitive major updates",
+      "description": "reqwest/argon2/oauth2 major bumps tend to break compilation or change password-hashing behavior; keep them out of the routine cargo group so one breaking bump doesn't block everything else."
+    },
+    {
       "matchManagers": ["npm"],
       "groupName": "web dependencies"
     },
