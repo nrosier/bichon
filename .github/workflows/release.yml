@@ -16,8 +16,8 @@ permissions:
 
 jobs:
   # Fails in seconds if the image would have nowhere to go, rather than after the
-  # six-target matrix and the GitHub release have already run. Kept in its own job
-  # so the credentials are not in any build job's environment.
+  # build and the GitHub release have already run. Kept in its own job so the
+  # credentials are not in any build job's environment.
   preflight:
     name: Check Docker Hub credentials
     runs-on: ubuntu-latest
@@ -45,16 +45,6 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-          - target: x86_64-apple-darwin
-            os: macos-latest
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-          - target: aarch64-apple-darwin
-            os: macos-latest
 
     steps:
       - name: Checkout code
@@ -102,30 +92,17 @@ jobs:
           pnpm install
           pnpm run build
 
-      - name: Install musl-tools (Linux musl only)
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-
-      - name: Build aarch64 Rust backend
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          cargo install cross --force
-          cross build --release --target=${{ matrix.target }}
-
       - name: Build Rust backend
-        if: matrix.target != 'aarch64-unknown-linux-gnu'
         run: |
-          cargo build --release --target=${{ matrix.target }}  
+          cargo build --release --target=${{ matrix.target }}
 
-      - name: Strip binary (Linux and macOS)
-        if: matrix.os != 'windows-latest' && matrix.target != 'aarch64-unknown-linux-gnu'
+      - name: Strip binary
         run: |
           strip target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}
           strip target/${{ matrix.target }}/release/${{ env.BINARY_CLI }}
           strip target/${{ matrix.target }}/release/${{ env.BINARY_ADMIN }}
 
-      - name: Pack artifact (Linux/macOS)
-        if: matrix.os != 'windows-latest'
+      - name: Pack artifact
         shell: bash
         run: |
           mkdir -p release
@@ -138,33 +115,10 @@ jobs:
           mv "${{ env.BINARY_NAME }}-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" release/
 
       - name: Upload build artifact
-        if: matrix.os != 'windows-latest'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
           path: release/${{ env.BINARY_NAME }}-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
-      
-      - name: Create zip archive (Windows)
-        if: matrix.os == 'windows-latest'
-        shell: pwsh
-        run: |
-          mkdir -p release
-
-          Copy-Item "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}.exe" release/
-          Copy-Item "target/${{ matrix.target }}/release/${{ env.BINARY_CLI }}.exe" release/
-          Copy-Item "target/${{ matrix.target }}/release/${{ env.BINARY_ADMIN }}.exe" release/
-
-          Copy-Item -Path README.md -Destination release/
-          Copy-Item -Path LICENSE -Destination release/
-          
-          Compress-Archive -Path release\* -DestinationPath "release/${{ env.BINARY_NAME }}-${{ github.ref_name }}-${{ matrix.target }}.zip" -Force
-
-      - name: Upload build artifact
-        if: matrix.os == 'windows-latest'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.target }}
-          path: release/${{ env.BINARY_NAME }}-${{ github.ref_name }}-${{ matrix.target }}.zip
 
   release:
     name: Create GitHub Release
