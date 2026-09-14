@@ -33,3 +33,5 @@ overrides:
   minimatch@9: ^10.0.0
   # Non-secure generators can loop indefinitely.
   nanoid@3: ^6.0.0
+  # Several host-confusion/SSRF/path-traversal advisories in URI parsing.
+  fast-uri@3: ^3.1.7
