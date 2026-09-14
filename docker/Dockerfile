@@ -1,4 +1,4 @@
-FROM ubuntu:26.04
+FROM alpine:3.22
 ARG CRATE_VERSION
 ARG TARGETARCH
 # Build provenance. Both default to empty so a plain `docker build` still works.
@@ -23,7 +23,7 @@ LABEL org.opencontainers.image.created="${BUILT_AT}"
 # Set working directory
 WORKDIR /opt/bichon
 
-# Copy compiled binary (ensure it's statically linked or compatible with bullseye)
+# Copy compiled binary (statically linked against musl, so it runs unmodified here)
 COPY ${TARGETARCH}/bichon-server /opt/bichon/bichon-server
 COPY ${TARGETARCH}/LICENSE /opt/bichon/
 
@@ -39,11 +39,7 @@ RUN chmod +x /usr/local/bin/bichon-admin
 
 
 # Install ca-certificates to ensure HTTPS certificate verification works correctly
-RUN apt update && apt install -y ca-certificates curl && rm -rf /var/lib/apt/lists/*
-# ubuntu:26.04 bundles Canonical's Pebble service manager, which we never
-# invoke (bichon-server runs directly as CMD). Its vendored Go stdlib trips
-# HIGH-severity CVEs in the Trivy scan gate, so drop the unused binary.
-RUN rm -f /usr/bin/pebble
+RUN apk add --no-cache ca-certificates curl
 # Create data directory
 RUN mkdir -p /data
 

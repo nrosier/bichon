@@ -41,8 +41,6 @@ jobs:
   image:
     name: Build, scan and push linux/amd64 (main)
     needs: preflight
-    # Pinned to the release the image is built FROM, so the binaries link
-    # against the same glibc they will run against.
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout code
@@ -61,8 +59,17 @@ jobs:
         run: |
           set -euo pipefail
           rustup toolchain install stable --profile minimal --no-self-update
+          rustup target add x86_64-unknown-linux-musl
           rustup default stable
           cargo --version
+
+      # Static linking against musl needs musl-gcc as the linker, since the
+      # runner's own toolchain only targets glibc.
+      - name: Install musl build tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq musl-tools
 
       - name: Cache cargo registry and build output
         uses: actions/cache@v6
@@ -72,9 +79,9 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: cargo-release-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-release-musl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-release-${{ runner.os }}-
+            cargo-release-musl-${{ runner.os }}-
 
       - name: Set up Node.js
         uses: actions/setup-node@v7
@@ -96,7 +103,10 @@ jobs:
           pnpm run build
 
       - name: Build the release binaries
-        run: cargo build --release --locked
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
 
       - name: Stage the binaries for the image
         run: |
@@ -106,7 +116,7 @@ jobs:
           # `[profile.release] strip = true` in Cargo.toml already stripped these.
           mkdir -p docker/amd64
           for binary in bichon-server bichon-cli bichon-admin; do
-            install -m 0755 "target/release/$binary" "docker/amd64/$binary"
+            install -m 0755 "target/x86_64-unknown-linux-musl/release/$binary" "docker/amd64/$binary"
           done
           cp LICENSE docker/amd64/LICENSE
           ls -l docker/amd64
