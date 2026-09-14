@@ -19,6 +19,24 @@
       "description": "reqwest/argon2/oauth2 major bumps tend to break compilation or change password-hashing behavior; keep them out of the routine cargo group so one breaking bump doesn't block everything else."
     },
     {
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["reqwest"],
+      "allowedVersions": "<0.13.0",
+      "description": "reqwest 0.13 renames the rustls-tls feature bichon-core depends on and is incompatible with oauth2 5.0's vendored reqwest 0.12 (oauth2::reqwest::ClientBuilder types won't unify with a 0.13 Client/Proxy) — held back until oauth2 supports reqwest 0.13. See commit 49997cb."
+    },
+    {
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["argon2"],
+      "allowedVersions": "<0.6.0",
+      "description": "argon2 0.6 moves PasswordHash/SaltString into password-hash's new phc module and makes hash_password generic, breaking crates/core/src/users/mod.rs and utils/totp.rs — needs a manual port before adopting. See commit 49997cb."
+    },
+    {
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["native_model"],
+      "allowedVersions": "<0.6.0",
+      "description": "native_db 0.8.2 (current latest release) hard-pins native_model =0.4.20; native_model 0.6 can't be used until native_db ships support for it upstream. See commit 49997cb."
+    },
+    {
       "matchManagers": ["npm"],
       "groupName": "web dependencies"
     },
