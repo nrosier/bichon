@@ -1537,7 +1537,7 @@ fn durability_full_vs_batch_vs_off() {
 
 #[tokio::test]
 async fn bench_concurrent_read_scaling() {
-    use rand::Rng;
+    use rand::RngExt;
 
     let db = Arc::new(MemDb::in_memory());
     let n_records = 50_000u64;
