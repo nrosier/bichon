@@ -17,7 +17,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import { useState, useMemo } from 'react'
-import { useFieldArray, useForm } from 'react-hook-form'
+import { useFieldArray, useForm, type Resolver } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { Loader2, Shield, Settings2, UserIcon, Plus, Trash2, Mail, Check, ChevronsUpDown } from 'lucide-react'
@@ -145,7 +145,9 @@ export function UserActionDialog({ currentRow, open, onOpenChange }: Props) {
   const { minimalList: allAccounts } = useMinimalAccountList()
 
   const form = useForm<UserForm>({
-    resolver: zodResolver(isEdit ? getUpdateUserSchema(t) : getCreateUserSchema(t)),
+    resolver: zodResolver(
+      isEdit ? getUpdateUserSchema(t) : getCreateUserSchema(t)
+    ) as Resolver<UserForm>,
     defaultValues: useMemo(() => {
       if (isEdit && currentRow) {
         const accessEntries = currentRow.account_access_map
