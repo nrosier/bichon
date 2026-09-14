@@ -1,4 +1,4 @@
-FROM alpine:3.22
+FROM alpine:3.24
 ARG CRATE_VERSION
 ARG TARGETARCH
 # Build provenance. Both default to empty so a plain `docker build` still works.
