@@ -1,4 +1,3 @@
-# Use Debian bullseye-slim as the base image for newer OpenSSL
 FROM ubuntu:26.04
 ARG CRATE_VERSION
 ARG TARGETARCH
@@ -41,6 +40,10 @@ RUN chmod +x /usr/local/bin/bichon-admin
 
 # Install ca-certificates to ensure HTTPS certificate verification works correctly
 RUN apt update && apt install -y ca-certificates curl && rm -rf /var/lib/apt/lists/*
+# ubuntu:26.04 bundles Canonical's Pebble service manager, which we never
+# invoke (bichon-server runs directly as CMD). Its vendored Go stdlib trips
+# HIGH-severity CVEs in the Trivy scan gate, so drop the unused binary.
+RUN rm -f /usr/bin/pebble
 # Create data directory
 RUN mkdir -p /data
 
