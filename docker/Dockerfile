@@ -38,8 +38,10 @@ RUN chmod +x /usr/local/bin/bichon-cli
 RUN chmod +x /usr/local/bin/bichon-admin
 
 
-# Install ca-certificates to ensure HTTPS certificate verification works correctly
-RUN apk add --no-cache ca-certificates curl
+# Upgrade base packages so already-installed libs (e.g. libssl3/libcrypto3)
+# pick up fixes published after this alpine:3.22 tag was last rebuilt, then
+# install ca-certificates to ensure HTTPS certificate verification works.
+RUN apk upgrade --no-cache && apk add --no-cache ca-certificates curl
 # Create data directory
 RUN mkdir -p /data
 
