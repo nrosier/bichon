@@ -1,0 +1,88 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Build (cargo)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          cargo --version
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          # Must stay >= 22.13: pnpm 11's declared engine floor.
+          node-version: 24
+
+      - name: Install pnpm
+        run: npm install -g pnpm@11
+
+      - name: Cache cargo registry and build output
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-build-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-build-${{ runner.os }}-
+
+      # bichon-server's build.rs shells out to `pnpm run build` to embed the
+      # frontend into the binary, so node_modules must exist before cargo
+      # build runs it (see docker.yml, which does the same).
+      - name: pnpm install (frontend, for build.rs)
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+
+      # A plain debug build across the whole workspace. This exists to catch
+      # compile-time breakage from dependency bumps (e.g. a Cargo.lock that
+      # resolves to two incompatible versions of the same crate) before it
+      # merges, not to produce a shippable artifact - docker.yml owns that.
+      - name: cargo build
+        run: cargo build --workspace --locked
+
+  web:
+    name: Build (web)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          # Must stay >= 22.13: pnpm 11's declared engine floor.
+          node-version: 24
+
+      - name: Install pnpm
+        run: npm install -g pnpm@11
+
+      - name: Build the web UI
+        working-directory: ./web
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+          pnpm run build
