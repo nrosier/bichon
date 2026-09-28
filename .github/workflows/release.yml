@@ -160,7 +160,7 @@ jobs:
     needs: [build, release]
     # Pinned to the release the image is built FROM, so the binaries link against
     # the same glibc they will run against.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
 
     steps:
       - name: Checkout code
