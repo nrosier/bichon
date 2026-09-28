@@ -7,11 +7,11 @@ license = "AGPL-3.0-or-later"
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-thiserror = "=2.0.20"
+thiserror = "=2.0.21"
 tokio.workspace = true
 
 [dev-dependencies]
 # 0.9.3 is the first release without RUSTSEC-2026-0097. The exact pin here also
 # fixes the version for governor and mail-send, which share this 0.9 requirement.
-rand = "=0.10.2"
+rand = "=0.10.3"
 tempfile = "=3.27.0"
