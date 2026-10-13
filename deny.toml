@@ -43,6 +43,10 @@ ignore = [
     # the advisory database. Kept so this check does not turn red when
     # cargo-deny's copy catches up.
     { id = "RUSTSEC-2026-0253", reason = "lru 0.16 via tantivy, which cannot take the 0.18.2 fix" },
+    # unsafe-libyaml 0.2 via serde_yaml 0.9, reached through poem and poem-openapi
+    # (YAML rendering of the OpenAPI spec). Unmaintained, not vulnerable; poem
+    # 3.1.12 is the latest release and still depends on serde_yaml.
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml via serde_yaml via poem; unmaintained, not vulnerable, no poem release moves off it" },
 ]
 
 [licenses]

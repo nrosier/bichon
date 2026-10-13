@@ -24,4 +24,8 @@ ignore = [
     # lru 0.16 via tantivy 0.26.1, the latest release, which requires ^0.16. The
     # fix landed in 0.18.2. Unsound only under a panic inside LruCache::pop().
     "RUSTSEC-2026-0253",
+    # unsafe-libyaml 0.2 via serde_yaml 0.9, reached through poem and poem-openapi
+    # (YAML rendering of the OpenAPI spec). Unmaintained, not vulnerable; poem
+    # 3.1.12 is the latest release and still depends on serde_yaml.
+    "RUSTSEC-2024-0449",
 ]
