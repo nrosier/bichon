@@ -25,6 +25,7 @@ use uuid::Uuid;
 use crate::{
     account::migration::AccountModel,
     archive::imap::mailbox::MailBox,
+    backup::gate::{BACKUP_ACQUIRE_TIMEOUT, WRITE_GATE},
     common::AddrVec,
     envelope::{meta::parse_bichon_metadata, utils::normalize_subject},
     error::{code::ErrorCode, BichonResult},
@@ -62,6 +63,7 @@ pub async fn extract_envelope_and_store_it(
     account_id: u64,
     mailbox_id: u64,
 ) -> BichonResult<()> {
+    let _write_guard = WRITE_GATE.acquire(BACKUP_ACQUIRE_TIMEOUT).await?;
     let internal_date = fetch
         .internal_date()
         .map(|d| d.timestamp_millis())
@@ -89,6 +91,7 @@ pub async fn extract_envelope_from_eml(
     account_id: u64,
     mailbox_id: u64,
 ) -> BichonResult<ExtractOutcome> {
+    let _write_guard = WRITE_GATE.acquire(BACKUP_ACQUIRE_TIMEOUT).await?;
     extract_envelope_core(body, 0, body.len() as u32, 0, account_id, mailbox_id).await
 }
 
@@ -97,6 +100,7 @@ pub async fn extract_envelope_from_smtp(
     account_id: u64,
     mailbox_id: u64,
 ) -> BichonResult<ExtractOutcome> {
+    let _write_guard = WRITE_GATE.acquire(BACKUP_ACQUIRE_TIMEOUT).await?;
     extract_envelope_core(
         body,
         0,
@@ -123,14 +127,21 @@ async fn extract_envelope_core(
         // println!("Duplicate email detected");
         return Ok(ExtractOutcome::Duplicate);
     }
+    // A message that cannot be parsed is a per-message failure, not a system
+    // failure: streaming callers match on EmailParseError to skip the message
+    // (it is NOT archived) and continue with the rest of the batch instead of
+    // letting one broken email abort the whole folder (#377).
     let message: Message<'_> = MessageParser::new().parse(body).ok_or_else(|| {
         raise_error!(
-            "Email header parse result is not available".into(),
-            ErrorCode::InternalError
+            format!(
+                "Email parse failed (uid {uid}, {size} bytes): message not archived"
+            ),
+            ErrorCode::EmailParseError
         )
     })?;
 
-    if let Ok(account) = AccountModel::get(account_id) {
+    let account = AccountModel::get(account_id).ok();
+    if let Some(ref account) = account {
         if let Some(ref rules) = account.archive_rules {
             let sender = message.from().and_then(|addr| {
                 AddrVec::from(addr)
@@ -201,6 +212,29 @@ async fn extract_envelope_core(
     } else {
         internal_date
     };
+
+    // Retention floor: never ingest a message whose effective date is already
+    // outside the account's retention window. The sweep purges those envelopes,
+    // so without this a full UID re-sync (UIDVALIDITY change / mailbox rebuild)
+    // would treat them as missing and re-download them, fighting the sweep
+    // forever. While an account is on legal hold retention is suspended, so the
+    // floor is disabled and nothing is dropped.
+    if let Some(ref account) = account {
+        let days = account.retention_days_effective();
+        if days > 0 && !account.is_on_hold() {
+            if let Some(effective) = crate::retention::effective_date_ms(date, internal_date) {
+                if effective < crate::retention::retention_cutoff_ms(days) {
+                    tracing::debug!(
+                        account_id,
+                        uid,
+                        effective,
+                        "Email outside retention window, skipping ingest"
+                    );
+                    return Ok(ExtractOutcome::Imported);
+                }
+            }
+        }
+    }
     let parse_addrs = |addrs: Option<&Address<'_>>| {
         addrs
             .map(|addr| {
@@ -806,14 +840,19 @@ async fn recover_message_blob(envelope: &Envelope) -> BichonResult<Bytes> {
                 ErrorCode::InternalError
             )
         })?;
-    detach_and_store_attachments(
-        &raw_body,
-        &message,
-        &fetched_hash,
-        envelope.account_id,
-        envelope.mailbox_id,
-    )
-    .await;
+    // Persist the recovered blob for future requests — unless a backup window
+    // is open, in which case we still return the content to the caller but skip
+    // the write so the blob store stays byte-stable for the running snapshot.
+    if !WRITE_GATE.is_paused() {
+        detach_and_store_attachments(
+            &raw_body,
+            &message,
+            &fetched_hash,
+            envelope.account_id,
+            envelope.mailbox_id,
+        )
+        .await;
+    }
 
     Ok(Bytes::from(raw_body))
 }
@@ -821,6 +860,56 @@ async fn recover_message_blob(envelope: &Envelope) -> BichonResult<Bytes> {
 #[cfg(test)]
 mod test {
     use html2text::config;
+
+    use std::sync::Once;
+
+    /// Extract tests touch the process-global settings/DB/DEDUP_CACHE, so they
+    /// need the same one-time environment as the backup config tests, and they
+    /// serialize with those via the shared lock (convention: see
+    /// `backup::BACKUP_STATE_TESTS`).
+    static TEST_ENV: Once = Once::new();
+
+    fn init_test_env() {
+        TEST_ENV.call_once(|| {
+            let root = std::env::temp_dir().join(format!(
+                "bichon-extractor-test-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            std::env::set_var("BICHON_ROOT_DIR", &root);
+            std::env::set_var("BICHON_ENCRYPT_PASSWORD", "test-password");
+            let _ = &*crate::settings::cli::SETTINGS;
+            let _ = &*crate::database::manager::DB_MANAGER;
+        });
+    }
+
+    /// A body that cannot be parsed must surface as `EmailParseError` (not a
+    /// generic InternalError): the batch streaming path matches on that code
+    /// to skip the single message and keep the batch going (#377). Pins the
+    /// classification contract end to end — if a parser upgrade starts
+    /// parsing this junk, the input here needs replacing, not the assertion.
+    #[tokio::test]
+    async fn unparseable_body_raises_email_parse_error() {
+        let _run_guard = crate::backup::BACKUP_STATE_TESTS.lock().await;
+        init_test_env();
+        // mail-parser 0.11 is extremely lenient (even binary junk parses as a
+        // header-less message); the empty body is the input it still refuses,
+        // so it pins the classification. If a parser upgrade starts parsing
+        // this, replace the input — the assertion is the contract.
+        let junk: &[u8] = b"";
+        assert!(
+            mail_parser::MessageParser::new().parse(junk).is_none(),
+            "test input must actually be unparseable for the classification to apply"
+        );
+        let err = super::extract_envelope_from_eml(junk, 1, 1)
+            .await
+            .expect_err("unparseable body must be an error");
+        assert_eq!(
+            err.code(),
+            crate::error::code::ErrorCode::EmailParseError,
+            "parse failures must classify as EmailParseError, got {err:?}"
+        );
+    }
 
     #[test]
     fn test_various_html_with_overflow_enabled() {

@@ -10,8 +10,8 @@ use bichon_core::{
         migration::{AccountModel, AccountType},
         since::{DateSince, RelativeDate},
     },
-    autoconfig::entity::MailServerConfig,
     archive::imap::mailbox::Attribute,
+    autoconfig::entity::MailServerConfig,
     database::batch_insert_impl,
     error::{code::ErrorCode, BichonError, BichonResult},
     raise_error,
@@ -264,6 +264,15 @@ impl From<AccountV3> for AccountModel {
             deleting: false,
             archive_rules: None,
             extraction_rules: None,
+            // Newer fields default to the safe values: migrated accounts never
+            // start auto-purging (retention disabled) and are never on hold.
+            retention_days: None,
+            legal_hold: false,
+            hold_reason: None,
+            hold_placed_by: None,
+            hold_placed_at: None,
+            hold_released_by: None,
+            hold_released_at: None,
         }
     }
 }
@@ -580,6 +589,8 @@ impl From<BichonUserV2> for bichon_core::users::BichonUserV2 {
             totp_secret: None,
             totp_enabled: false,
             totp_recovery_codes: Vec::new(),
+            global_role_expiries: Default::default(),
+            account_role_expiries: Default::default(),
         }
     }
 }

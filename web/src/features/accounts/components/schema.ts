@@ -63,11 +63,12 @@ const relativeDateSchema = (t: (key: string) => string) =>
 const dateSelectionSchema = (t: (key: string) => string) =>
   z
     .object({
+      // nullish: the API returns the unused half as null
       fixed: z
         .string({ message: t('accounts.selectDate') })
         .min(1, { message: t('accounts.selectDate') })
-        .optional(),
-      relative: relativeDateSchema(t).optional(),
+        .nullish(),
+      relative: relativeDateSchema(t).nullish(),
     })
     .optional()
 
@@ -176,6 +177,14 @@ export const getAccountSchema = (isEdit: boolean, t: (key: string) => string) =>
       ),
     archive_rules: archiveRulesSchema(t).optional(),
     extraction_rules: extractionRulesSchema(t).optional(),
+    retention_days: z
+      .number({
+        invalid_type_error: t('validation.retentionDaysMustBeNumber'),
+      })
+      .int()
+      .min(0, { message: t('validation.retentionDaysMustBeNonNegative') })
+      .max(3650, { message: t('validation.retentionDaysTooLarge') })
+      .optional(),
   })
 
 export type AccountFormValues = z.infer<ReturnType<typeof getAccountSchema>>

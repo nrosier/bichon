@@ -211,6 +211,9 @@ fn provision(identity: &SsoIdentity, default_role_id: u64) -> BichonResult<UserM
                 .unwrap_or_default()
         )),
         global_roles: vec![resolve_role(default_role_id)],
+        // The default role is permanent: no expiry entry.
+        global_role_expiries: Default::default(),
+        account_role_expiries: Default::default(),
         avatar: None,
         created_at: now,
         updated_at: now,

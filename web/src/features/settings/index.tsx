@@ -20,7 +20,7 @@
 import { Outlet } from '@tanstack/react-router'
 import { Main } from '@/components/layout/main'
 import SidebarNav from './components/sidebar-nav'
-import { Brush, KeyRound, LockKeyhole, Palette, SettingsIcon, ShieldCheck, UserCog, Waypoints } from 'lucide-react'
+import { BadgeCheck, Brush, FileCode2, KeyRound, LockKeyhole, Palette, Radar, SettingsIcon, ShieldCheck, UserCog, Users, Waypoints } from 'lucide-react'
 import { FixedHeader } from '@/components/layout/fixed-header'
 import { useCurrentUser } from '@/hooks/use-current-user'
 import { useEdition } from '@/hooks/use-edition'
@@ -30,7 +30,7 @@ import { Separator } from '@/components/ui/separator'
 export default function Settings() {
   const { t } = useTranslation()
   const { canGlobal, require_any_permission } = useCurrentUser()
-  const { isPro } = useEdition()
+  const { isPro, isEnterprise } = useEdition()
 
 
   const sidebarNavItems = [
@@ -61,6 +61,18 @@ export default function Settings() {
       visible: isPro && require_any_permission(['system:root', 'user:manage']),
     },
     {
+      title: t('settings.sidebar.siem', 'SIEM'),
+      href: '/settings/siem',
+      icon: <Radar size={18} />,
+      visible: isEnterprise && require_any_permission(['system:root', 'user:manage']),
+    },
+    {
+      title: t('settings.sidebar.approvals', 'Dual control'),
+      href: '/settings/approvals',
+      icon: <Users size={18} />,
+      visible: isEnterprise && require_any_permission(['system:root', 'user:manage']),
+    },
+    {
       title: t('settings.sidebar.apiTokens'),
       href: '/settings/api-tokens',
       icon: <KeyRound size={18} />,
@@ -75,6 +87,17 @@ export default function Settings() {
       icon: <SettingsIcon size={18} />,
       href: '/settings/configurations',
       visible: canGlobal('system:root'),
+    },
+    {
+      title: t('navigation.license'),
+      href: '/settings/license',
+      icon: <BadgeCheck size={18} />,
+      visible: isPro && require_any_permission(['system:root', 'user:manage']),
+    },
+    {
+      title: t('navigation.apiDocs'),
+      href: '/settings/api-docs',
+      icon: <FileCode2 size={18} />,
     },
   ].filter(item => item.visible !== false)
 

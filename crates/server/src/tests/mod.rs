@@ -5,6 +5,7 @@
 
 pub mod access_token_tests;
 pub mod account_tests;
+pub mod backup_tests;
 pub mod oauth2_tests;
 pub mod oidc_tests;
 pub mod proxy_tests;
@@ -56,18 +57,21 @@ pub async fn setup() {
         return;
     }
 
-    // `BICHON_ROOT_DIR` has no default, and `Settings` exits the process when it
-    // is missing — which would abort the whole test binary rather than fail one
-    // test. Supplying one here keeps a bare `cargo test` working; an explicit
-    // value in the environment still wins. The pid keeps concurrent cargo
-    // invocations off each other's data. This runs before the first read of
-    // `SETTINGS` below, which is what forces the lazy parse.
-    if std::env::var_os("BICHON_ROOT_DIR").is_none() {
-        let root = std::env::temp_dir().join(format!("bichon-test-{}", std::process::id()));
-        std::env::set_var("BICHON_ROOT_DIR", &root);
+    // Unit tests never pass --bichon-root-dir, and the settings parser now
+    // panics on a missing data root for server runs (restore subcommand
+    // excepted). Provide a throwaway root + encryption password before the
+    // first SETTINGS use so the test binary boots like a configured server.
+    if std::env::var("BICHON_ROOT_DIR").is_err() {
+        std::env::set_var(
+            "BICHON_ROOT_DIR",
+            std::env::temp_dir().join(format!("bichon-server-test-{}", std::process::id())),
+        );
+    }
+    if std::env::var("BICHON_ENCRYPT_PASSWORD").is_err() {
+        std::env::set_var("BICHON_ENCRYPT_PASSWORD", "test-password");
     }
 
-    let root = PathBuf::from(&SETTINGS.bichon_root_dir);
+    let root = PathBuf::from(SETTINGS.root_dir());
     if root.exists() {
         let _ = std::fs::remove_dir_all(&root);
     }

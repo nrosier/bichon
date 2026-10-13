@@ -12,6 +12,7 @@ fn api_client(route: impl poem::Endpoint) -> TestClient<impl poem::Endpoint> {
     TestClient::new(route).default_header("X-Forwarded-For", "127.0.0.1")
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct SystemConfig {
     bichon_root_dir: String,
@@ -19,10 +20,7 @@ struct SystemConfig {
     bichon_version: Option<String>,
 }
 
-// Deserializing is the assertion: serde rejects the payload if a field the
-// dashboard reads goes missing or changes type. The counts are legitimately zero
-// on a fresh install, so there is nothing meaningful to assert about their
-// values and rustc cannot see them being read.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct DashboardStats {

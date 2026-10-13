@@ -13,7 +13,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "2.0.3"
+version = "2.1.1"
 edition = "2021"
 # Matches the per-file headers: AGPL v3 "or (at your option) any later version".
 license = "AGPL-3.0-or-later"
@@ -60,8 +60,8 @@ oauth2 = { version = "5.0.0", features = ["reqwest-blocking"] }
 url = { version = "2.5.8", features = ["serde"] }
 sysinfo = "0.39"
 num_cpus = "1.17.0"
-rand = "0.10.2"
-encoding_rs = "0.8.35"
+rand = "0.10"
+encoding_rs = "0.8"
 webpki-roots = "1.0"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rustls-pki-types = "1.15"
@@ -90,7 +90,7 @@ mail-send = "0.6"
 rcgen = "0.14"
 rustls-pemfile = "2.2.0"
 blake3 = "1.8"
-uuid = { version = "1.26", features = ["v4", "serde"] }
+uuid = { version = "1.26", features = ["v4", "v7", "serde"] }
 fjall = { version = "3.1", features = ["lz4", "metrics", "bytes_1"] }
 tracing-log = "0.2.0"
 tokio-util = "0.7"

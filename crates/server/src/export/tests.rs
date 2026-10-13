@@ -33,17 +33,19 @@ static SETUP: OnceCell<()> = OnceCell::const_new();
 async fn setup() {
     SETUP
         .get_or_init(|| async {
-            // Mirrors crate::tests::setup(): this module has its own SETUP cell, so
-            // it may be the first thing in the bichon-server test binary to touch
-            // SETTINGS. Without BICHON_ROOT_DIR set first, Settings::init() exits
-            // the whole process, taking every other test in the binary down with it.
-            if std::env::var_os("BICHON_ROOT_DIR").is_none() {
-                let root = std::env::temp_dir()
-                    .join(format!("bichon-test-{}", std::process::id()));
-                std::env::set_var("BICHON_ROOT_DIR", &root);
+            // Unit tests never pass CLI flags; give the settings parser a
+            // throwaway data root + encryption password before first use.
+            if std::env::var("BICHON_ROOT_DIR").is_err() {
+                std::env::set_var(
+                    "BICHON_ROOT_DIR",
+                    std::env::temp_dir()
+                        .join(format!("bichon-server-export-test-{}", std::process::id())),
+                );
             }
-
-            let root = PathBuf::from(&SETTINGS.bichon_root_dir);
+            if std::env::var("BICHON_ENCRYPT_PASSWORD").is_err() {
+                std::env::set_var("BICHON_ENCRYPT_PASSWORD", "test-password");
+            }
+            let root = PathBuf::from(SETTINGS.root_dir());
             if root.exists() {
                 let _ = std::fs::remove_dir_all(&root);
             }

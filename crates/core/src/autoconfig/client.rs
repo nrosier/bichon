@@ -317,69 +317,7 @@ fn extract_base_domain(host: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// Probes 25 third-party autoconfig endpoints and prints what each returned.
-    ///
-    /// A connectivity diagnostic, not a test: it asserts nothing, needs the
-    /// network, and its result depends on 25 services outside this project — so
-    /// a red run here says nothing about this code. It also accounted for
-    /// essentially the whole runtime of the crate's suite. Run it deliberately:
-    ///
-    /// ```text
-    /// cargo test -p bichon-core test_fetch_valid_domain -- --ignored --nocapture
-    /// ```
-    #[tokio::test]
-    #[ignore = "diagnostic: probes 25 third-party autoconfig endpoints over the network"]
-    async fn test_fetch_valid_domain() {
-        // `fetch` goes out over TLS, and rustls panics unless a process-level
-        // provider is installed. Production installs it via `BichonTls`
-        // (common::rustls) during startup, which no test binary runs; until this
-        // test was ignored it only ever worked because a scratch test elsewhere
-        // in the binary happened to install one first. `.ok()` because another
-        // test in the same process may have already done it.
-        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider())
-            .ok();
-
-        let domains = vec![
-            // North America
-            ("gmail.com", "Google Gmail"),
-            ("outlook.com", "Microsoft Outlook"),
-            ("hotmail.com", "Microsoft Hotmail"),
-            ("yahoo.com", "Yahoo Mail"),
-            ("icloud.com", "Apple iCloud"),
-            ("aol.com", "AOL Mail"),
-            ("protonmail.com", "ProtonMail"),
-            ("zoho.com", "Zoho Mail"),
-            ("fastmail.com", "FastMail"),
-            // Europe
-            ("gmx.de", "GMX Germany"),
-            ("gmx.net", "GMX International"),
-            ("web.de", "Web.de Germany"),
-            ("freenet.de", "Freenet Germany"),
-            ("mail.ru", "Mail.ru Russia"),
-            ("yandex.ru", "Yandex Russia"),
-            ("orange.fr", "Orange France"),
-            ("laposte.net", "La Poste France"),
-            ("libero.it", "Libero Italy"),
-            ("tiscali.it", "Tiscali Italy"),
-            ("telenet.be", "Telenet Belgium"),
-            // Asia Pacific
-            ("qq.com", "Tencent QQ"),
-            ("163.com", "NetEase 163"),
-            ("126.com", "NetEase 126"),
-            ("sina.com", "Sina Mail"),
-            ("naver.com", "Naver Korea"),
-        ];
-
-        for (domain, label) in &domains {
-            let result = fetch(domain).await;
-            match result {
-                Ok(config) => println!("✅ [{label}] {domain}: {config:#?}"),
-                Err(e) => println!("⚠️  [{label}] {domain}: {e:?}"),
-            }
-        }
-    }
-
-    #[test]
+        #[test]
     fn test_parse_autoconfig_xml() {
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <clientConfig version="1.1">

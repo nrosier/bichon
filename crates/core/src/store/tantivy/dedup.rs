@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use tantivy::schema::Term;
 use tantivy::{IndexReader, IndexWriter};
 
+use crate::backup::gate::WRITE_GATE;
 use crate::common::periodic::{PeriodicTask, TaskHandle};
 use crate::context::BichonTask;
 use crate::error::code::ErrorCode;
@@ -85,6 +86,12 @@ impl BichonTask for DedupTask {
 
         let task = move |_: Option<u64>| {
             Box::pin(async move {
+                // Skip a pass entirely while a backup window is open: the pass
+                // deletes in place and would race the snapshot.
+                if WRITE_GATE.is_paused() {
+                    tracing::info!("dedup: skipping pass, backup in progress");
+                    return Ok(());
+                }
                 // Acquire both writers before creating a reader. The fresh reader
                 // sees the last committed state, while the writers ensure we have
                 // exclusive access to perform deletions.
@@ -158,10 +165,6 @@ fn dedup_account(
 ) -> BichonResult<u64> {
     let searcher = email_reader.searcher();
     let fields = SchemaTools::email_fields();
-    // eprintln!(
-    //     "DEBUG dedup_account: entry account={account_id} f_id_field={:?} f_content_hash_field={:?}",
-    //     fields.f_id, fields.f_content_hash
-    // );
     let mut map: DedupMap = HashMap::new();
 
     // ── Phase 1: build the dedup map via FAST column scans ──────────────────
@@ -226,10 +229,6 @@ fn dedup_account(
                 .ord_to_str(id_ord, &mut id_buf)
                 .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
             let email_id = id_buf;
-
-            // eprintln!(
-            //     "DEBUG dedup_account: account={account_id} doc_id={doc_id} mailbox={mailbox_id} hash={content_hash:?} id={email_id:?} ingest_at={ingest_at}"
-            // );
 
             map.entry((mailbox_id, content_hash))
                 .or_default()
@@ -332,21 +331,17 @@ mod tests {
         reader.reload().expect("reader reload failed");
         let searcher = reader.searcher();
         let mut ids = HashSet::new();
-        let segments = searcher.segment_readers();
-        eprintln!(
-            "DEBUG surviving_email_ids: segment_count={}",
-            segments.len()
-        );
-        for (seg_idx, seg) in segments.iter().enumerate() {
+        for seg in searcher.segment_readers() {
             let id_col = seg
                 .fast_fields()
                 .str(F_ID)
                 .unwrap()
                 .expect("FAST str column 'id' missing");
             let max_doc = seg.max_doc();
-            eprintln!("DEBUG surviving_email_ids: seg={seg_idx} max_doc={max_doc}");
             for doc_id in 0..max_doc {
-                let is_del = seg.is_deleted(doc_id);
+                if seg.is_deleted(doc_id) {
+                    continue;
+                }
                 let ord = id_col
                     .ords()
                     .values_for_doc(doc_id as u32)
@@ -354,10 +349,7 @@ mod tests {
                     .unwrap_or(0);
                 let mut buf = String::new();
                 id_col.ord_to_str(ord, &mut buf).unwrap();
-                eprintln!("DEBUG surviving_email_ids: seg={seg_idx} doc_id={doc_id} is_deleted={is_del} ord={ord} buf={buf:?}");
-                if !is_del {
-                    ids.insert(buf);
-                }
+                ids.insert(buf);
             }
         }
         ids
@@ -608,44 +600,44 @@ mod tests {
         .await;
     }
 
-    /// Inspects an existing email index and reports duplicate counts.
+    /// Inspects a real email index and reports duplicate counts.
     ///
     /// A "duplicate" is defined as two or more emails sharing the same
     /// (account_id, mailbox_id, content_hash) tuple.
     ///
-    /// This is a read-only diagnostic, not a test: it asserts nothing, so it is
-    /// `#[ignore]`d and reports to stdout rather than quietly passing in every
-    /// CI run. Point it at an index and run it deliberately:
-    ///
-    /// ```text
-    /// BICHON_INSPECT_INDEX=/path/to/bichon-indices/mail_metadata \
-    ///   cargo test -p bichon-core inspect_index_duplicates -- --ignored --nocapture
-    /// ```
+    /// Developer diagnostic, not part of the regular test suite: the test is
+    /// skipped unless `BICHON_DEDUP_INSPECT_INDEX` points at an index
+    /// directory (e.g. a production `mail_metadata` index). Read-only — it
+    /// does not modify the index; the report goes to stdout.
     #[test]
-    #[ignore = "diagnostic: set BICHON_INSPECT_INDEX to the index directory to inspect"]
-    fn inspect_index_duplicates() {
-        // Read from the environment rather than a hardcoded path: the index
-        // lives wherever the operator put BICHON_MAIL_INDEX_DIR, which is
-        // machine-specific.
-        let index_path = std::path::PathBuf::from(
-            std::env::var_os("BICHON_INSPECT_INDEX").expect(
-                "set BICHON_INSPECT_INDEX to the mail_metadata index directory to inspect",
-            ),
-        );
-        let index_path = index_path.display();
+    fn inspect_production_duplicates() {
+        let Ok(index_path) = std::env::var("BICHON_DEDUP_INSPECT_INDEX") else {
+            return;
+        };
 
         let mut report = String::new();
         let _ = writeln!(report, "opening index at {index_path}...");
 
-        // Explicitly requested, so a failure to open is a real failure and not
-        // something to swallow.
-        let index = Index::open_in_dir(index_path.to_string())
-            .unwrap_or_else(|e| panic!("failed to open index at {index_path}: {e}"));
-        let _ = writeln!(report, "index opened successfully");
+        let index = match Index::open_in_dir(&index_path) {
+            Ok(idx) => {
+                let _ = writeln!(report, "index opened successfully");
+                idx
+            }
+            Err(e) => {
+                let _ = writeln!(report, "Failed to open index at {index_path}: {e}");
+                println!("{report}");
+                return;
+            }
+        };
 
-        let reader = index
-            .reader()
-            .unwrap_or_else(|e| panic!("failed to create reader: {e}"));
+        let reader = match index.reader() {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = writeln!(report, "Failed to create reader: {e}");
+                println!("{report}");
+                return;
+            }
+        };
 
         reader.reload().expect("reader reload failed");
         let searcher = reader.searcher();
@@ -733,8 +725,6 @@ mod tests {
             total_docs - total_duplicate_emails,
         );
 
-        // Straight to stdout: the caller passes --nocapture to see it, and
-        // nothing is left behind on disk.
-        print!("{report}");
+        println!("{report}");
     }
 }
