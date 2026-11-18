@@ -246,9 +246,10 @@ pub async fn oidc_local_logout(req: &Request) -> Response {
 /// only then sends the browser here.
 #[handler]
 pub async fn oidc_logout() -> Response {
-    let config = match OidcConfig::load() {
-        Ok(config) => config,
-        Err(e) => return sign_in_error("sso_unavailable", &e),
+    // With SSO off there is no provider session to end: a plain local sign-out,
+    // and no error, since signing out is normal in the default configuration.
+    let Ok(config) = OidcConfig::load() else {
+        return redirect_to_sign_in("?local=1");
     };
 
     // Absolute, because the provider redirects the browser back to us.
