@@ -17,6 +17,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import { z } from 'zod'
+import { invalidTypeError } from '@/lib/zod-errors'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useTranslation } from 'react-i18next'
@@ -64,7 +65,7 @@ const getAccessTokenSchema = (t: any) => z.object({
     .or(z.literal('')),
   expire_in: z
     .number({
-      invalid_type_error: t('apiTokens.form.errorNumber'),
+      error: invalidTypeError(t('apiTokens.form.errorNumber')),
     })
     .int(t('apiTokens.form.errorInt'))
     .positive(t('apiTokens.form.errorPositive'))

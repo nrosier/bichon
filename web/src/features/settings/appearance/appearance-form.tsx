@@ -18,6 +18,7 @@
 
 import { useEffect } from 'react'
 import { z } from 'zod'
+import { requiredError } from '@/lib/zod-errors'
 import { useForm } from 'react-hook-form'
 import { CaretSortIcon, CheckIcon } from '@radix-ui/react-icons'
 import { zodResolver } from '@hookform/resolvers/zod'
@@ -82,7 +83,7 @@ const appearanceSchema = (t: (key: string) => string) => z.object({
         message: t('settings.appearance.validation.theme.required'),
     }),
     language: z.string({
-        required_error: t('settings.appearance.validation.language.required'),
+        error: requiredError(t('settings.appearance.validation.language.required')),
     })
 })
 

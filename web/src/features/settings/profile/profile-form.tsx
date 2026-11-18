@@ -41,7 +41,7 @@ import { Badge } from '@/components/ui/badge'
 import { FileWithPreview } from '@/hooks/use-file-upload'
 import AvatarUpload from './avatar-upload'
 import { PermissionsDialog } from '../access/permissions-dialog'
-import { profileSchema, type ProfileFormValues } from './schema'
+import { profileSchema, type ProfileFormInput, type ProfileFormValues } from './schema'
 
 function fileToBase64(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -67,7 +67,7 @@ export function UserProfileForm({ user }: UserProfileFormProps) {
   const [permissionsOpen, setPermissionsOpen] = useState(false)
   const [permissionsAccountId, setPermissionsAccountId] = useState<number | undefined>(undefined)
 
-  const form = useForm<ProfileFormValues>({
+  const form = useForm<ProfileFormInput, unknown, ProfileFormValues>({
     resolver: zodResolver(profileSchema(t)),
     mode: 'onChange',
     defaultValues: {

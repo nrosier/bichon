@@ -18,6 +18,7 @@
 
 import React from 'react'
 import { z } from 'zod'
+import { requiredError } from '@/lib/zod-errors'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
@@ -93,7 +94,7 @@ export function AccountAccessAssignmentDialog({
             message: t('accounts.access_control.validation.user_required'),
         }),
         role_id: z.number({
-            required_error: t('accounts.access_control.validation.role_required'),
+            error: requiredError(t('accounts.access_control.validation.role_required')),
         }),
     })
 
