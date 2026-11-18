@@ -119,7 +119,9 @@ static CACHE: LazyLock<RwLock<Option<Cached>>> = LazyLock::new(|| RwLock::new(No
 
 /// Fetch the provider metadata, reusing the cached copy when it is still fresh.
 pub async fn provider_metadata(config: &OidcConfig) -> BichonResult<ProviderMetadata> {
-    provider_metadata_inner(config).await.map_err(into_bichon_error)
+    provider_metadata_inner(config)
+        .await
+        .map_err(into_bichon_error)
 }
 
 /// Like [`provider_metadata`], but a failure keeps its classification so the
@@ -127,9 +129,7 @@ pub async fn provider_metadata(config: &OidcConfig) -> BichonResult<ProviderMeta
 pub async fn provider_metadata_classified(
     config: &OidcConfig,
 ) -> Result<ProviderMetadata, DiscoveryFailure> {
-    provider_metadata_inner(config)
-        .await
-        .map_err(|f| f.failure)
+    provider_metadata_inner(config).await.map_err(|f| f.failure)
 }
 
 /// As [`provider_metadata_classified`], also returning the operator-facing
@@ -195,6 +195,10 @@ impl Failed {
     }
 }
 
+/// Largest discovery response body accepted, checked against `Content-Length`
+/// and against the bytes actually read.
+const MAX_DISCOVERY_BODY_BYTES: usize = 1024 * 1024;
+
 /// Fetch and validate the document at `url`, classifying every way it can fail.
 /// `issuer` must already have its trailing slash removed.
 async fn fetch_classified(url: &str, issuer: &str) -> Result<ProviderMetadata, Failed> {
@@ -236,7 +240,35 @@ async fn fetch_classified(url: &str, issuer: &str) -> Result<ProviderMetadata, F
         ));
     }
 
-    let body = response.bytes().await.map_err(|e| transport(&e, "read"))?;
+    // A discovery document is a few KiB; refuse anything far larger rather than
+    // buffering an unbounded body from a hostile or broken endpoint.
+    let too_large = || {
+        Failed::new(
+            fail(
+                DiscoveryKind::NotJson,
+                Some(status.as_u16()),
+                Some("response too large".to_owned()),
+            ),
+            format!(
+                "The OIDC discovery endpoint {} returned a response larger than {} bytes.",
+                url, MAX_DISCOVERY_BODY_BYTES
+            ),
+        )
+    };
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_DISCOVERY_BODY_BYTES as u64)
+    {
+        return Err(too_large());
+    }
+    let mut response = response;
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| transport(&e, "read"))? {
+        if body.len() + chunk.len() > MAX_DISCOVERY_BODY_BYTES {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
 
     let value: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
         Failed::new(
@@ -591,6 +623,24 @@ mod tests {
     async fn not_json() {
         let f = kind_for(http("200 OK", "", "<html>hi</html>")).await;
         assert_eq!(f.kind, DiscoveryKind::NotJson);
+    }
+
+    #[tokio::test]
+    async fn oversized_body_is_rejected_by_content_length() {
+        let body = " ".repeat(MAX_DISCOVERY_BODY_BYTES + 1);
+        let f = kind_for(http("200 OK", "", &body)).await;
+        assert_eq!(f.kind, DiscoveryKind::NotJson);
+        assert_eq!(f.hint.as_deref(), Some("response too large"));
+    }
+
+    #[tokio::test]
+    async fn oversized_body_is_rejected_while_reading() {
+        // No Content-Length: the cap must hold on the bytes actually read.
+        let body = " ".repeat(MAX_DISCOVERY_BODY_BYTES + 1);
+        let response = format!("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{body}");
+        let f = kind_for(response).await;
+        assert_eq!(f.kind, DiscoveryKind::NotJson);
+        assert_eq!(f.hint.as_deref(), Some("response too large"));
     }
 
     #[tokio::test]

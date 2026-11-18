@@ -41,7 +41,7 @@ const DEFAULT_ROLE_ID: u64 = 100200000000000;
 ///
 /// Constructing one of these is the single place that decides whether OIDC is
 /// usable, so handlers never have to re-check individual settings.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct OidcConfig {
     /// Issuer URL with any trailing slash removed. The discovery document is
     /// fetched from `{issuer_url}/.well-known/openid-configuration` and the
@@ -65,6 +65,24 @@ pub struct OidcConfig {
     /// restriction. Comes from the stored SSO document only; env-only setups
     /// leave it empty.
     pub allowed_email_domains: Vec<String>,
+}
+
+impl std::fmt::Debug for OidcConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OidcConfig")
+            .field("issuer_url", &self.issuer_url)
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .field("redirect_uri", &self.redirect_uri)
+            .field("default_role_id", &self.default_role_id)
+            .field("auto_redirect", &self.auto_redirect)
+            .field("link_by_email", &self.link_by_email)
+            .field("allowed_email_domains", &self.allowed_email_domains)
+            .finish()
+    }
 }
 
 impl OidcConfig {
@@ -384,6 +402,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn debug_redacts_the_client_secret() {
+        let config = OidcConfig {
+            issuer_url: "https://idp.example.com".into(),
+            client_id: "bichon".into(),
+            client_secret: Some("s3cr3t-unit-value".into()),
+            redirect_uri: "https://mail.example.com/api/auth/oidc/callback".into(),
+            default_role_id: 1,
+            auto_redirect: false,
+            link_by_email: false,
+            allowed_email_domains: vec![],
+        };
+        let out = format!("{config:?}");
+        assert!(!out.contains("s3cr3t-unit-value"), "{out}");
+        assert!(out.contains("<redacted>"), "{out}");
+        assert!(format!(
+            "{:?}",
+            OidcConfig {
+                client_secret: None,
+                ..config
+            }
+        )
+        .contains("client_secret: None"));
+    }
+
+    #[test]
     fn fork_only_settings_fall_back_to_their_defaults() {
         // Unset means "behave as before the setting existed", which is what an
         // upstream resync leaves an existing deployment with. For the two
@@ -400,9 +443,17 @@ mod tests {
 
     #[test]
     fn fork_only_settings_parse_what_an_operator_writes() {
-        assert_eq!(parse_role_id(Some("100200000000001")).unwrap(), 100200000000001);
+        assert_eq!(
+            parse_role_id(Some("100200000000001")).unwrap(),
+            100200000000001
+        );
         for (raw, expected) in [("true", true), ("TRUE", true), ("false", false)] {
-            assert_eq!(parse_bool("SETTING", Some(raw)).unwrap(), expected, "{}", raw);
+            assert_eq!(
+                parse_bool("SETTING", Some(raw)).unwrap(),
+                expected,
+                "{}",
+                raw
+            );
         }
     }
 
