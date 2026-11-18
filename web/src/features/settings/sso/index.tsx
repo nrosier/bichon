@@ -85,7 +85,7 @@ function valuesFromConfig(cfg: SsoConfigView): SsoFormValues {
 
 export function SsoSettings() {
   const { t } = useTranslation()
-  const { isPro, isLoading: editionLoading } = useEdition()
+  const { isPro, ssoSupported, isLoading: editionLoading } = useEdition()
   const { canGlobal, isLoading: userLoading } = useCurrentUser()
   const queryClient = useQueryClient()
 
@@ -102,7 +102,8 @@ export function SsoSettings() {
   )
 
   const canManage =
-    isPro && (canGlobal('system:root') || canGlobal('user:manage'))
+    (isPro || ssoSupported) &&
+    (canGlobal('system:root') || canGlobal('user:manage'))
 
   const secretAvailable = Boolean(current?.client_secret_set) && !clearSecret
   // The resolver is created once; this getter lets it observe the current

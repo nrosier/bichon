@@ -4,6 +4,7 @@ import { useQuery } from '@tanstack/react-query'
 export interface EditionInfo {
   edition: 'community' | 'pro' | 'enterprise'
   version: string
+  sso_supported?: boolean
   sso_enabled: boolean
   ldap_enabled: boolean
   siem_enabled: boolean
@@ -32,6 +33,8 @@ export function useEdition() {
     isEnterprise: data?.edition === 'enterprise',
     edition: data?.edition ?? 'community',
     version: data?.version ?? '',
+    /** The build can do SSO at all (also true on Community in this fork). */
+    ssoSupported: data?.sso_supported ?? false,
     ssoEnabled: data?.sso_enabled ?? false,
     ldapEnabled: data?.ldap_enabled ?? false,
     siemEnabled: data?.siem_enabled ?? false,

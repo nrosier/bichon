@@ -21,6 +21,7 @@ import {
   HTMLAttributes,
   forwardRef,
   useEffect,
+  useRef,
   useState,
   type ComponentProps,
   type ReactNode,
@@ -49,30 +50,19 @@ import { useLocation, useNavigate } from '@tanstack/react-router'
 import { Button } from '@/components/button'
 import { useTranslation } from 'react-i18next'
 import i18n from '@/i18n'
+import { SsoBlockedNotice, SsoInterstitial, useSsoSignIn } from '@/sso'
+import { SSO_ERROR_KEYS } from '@/sso/locales'
 
 /** Plain-language text for the OIDC error codes the server redirects with.
- *  Unknown codes fall back to showing the raw code. */
+ *  The fork's stable codes (`sso.error.<code>`) are merged over upstream's
+ *  map. Unknown codes fall back to showing the raw code. */
 const OIDC_ERROR_KEYS: Record<string, string> = {
   license_required: 'auth.ssoErrLicense',
-  email_domain_not_allowed: 'auth.ssoErrDomain',
-  discovery_invalid_issuer: 'settings.sso.errInvalidIssuer',
-  discovery_dns: 'settings.sso.errDns',
-  discovery_connection_refused: 'settings.sso.errRefused',
-  discovery_timeout: 'settings.sso.errTimeout',
-  discovery_tls: 'settings.sso.errTls',
-  discovery_network: 'settings.sso.errNetwork',
-  discovery_redirect: 'settings.sso.errRedirect',
-  discovery_not_found: 'settings.sso.errNotFound',
-  discovery_access_denied: 'settings.sso.errAccessDenied',
-  discovery_server_error: 'settings.sso.errServerError',
-  discovery_http_error: 'settings.sso.errServerError',
-  discovery_not_json: 'settings.sso.errNotJson',
-  discovery_incomplete: 'settings.sso.errIncomplete',
-  discovery_issuer_mismatch: 'settings.sso.errIssuerMismatch',
+  // Same codes upstream mapped, now covered by `sso.error.<code>` below.
+  ...SSO_ERROR_KEYS,
 }
 import { KeyRound, Loader2, Lock, LogIn, Shield, User } from 'lucide-react'
 import { ldapLogin, login, mfaVerify, type LoginResult } from '@/api/users/api'
-import { resolveApiUrl } from '@/api/branding/api'
 import { get_sso_status } from '@/api/sso/api'
 import { useTheme } from '@/context/theme-context'
 import { isTheme } from '@/lib/theme'
@@ -123,8 +113,9 @@ export function UserAuthForm({ className, ...props }: UserAuthFormProps) {
   const { t } = useTranslation()
   const { search } = useLocation();
   const redirect = toSearchParams(search).get('redirect') || '/';
+  const sso = useSsoSignIn(redirect)
 
-  const { isPro, ssoEnabled, ldapEnabled } = useEdition()
+  const { isPro, ssoSupported, ssoEnabled, ldapEnabled } = useEdition()
 
   // Ask whether the configured provider is actually reachable. A down IdP
   // used to be visible only in the server log: the page offered the button
@@ -140,12 +131,16 @@ export function UserAuthForm({ className, ...props }: UserAuthFormProps) {
   const ssoUnavailable = ssoStatus !== undefined && !ssoStatus.available
 
   // The OIDC callback redirects back here with ?oidc_error=<code>. Surface it
-  // once and strip it from the URL so a refresh does not repeat the toast.
+  // once. The code is read from the router's location at render time, not from
+  // `window.location`: `useSsoSignIn` strips the param from the URL in an effect
+  // that runs before this one, so the URL no longer has it by then. The hook
+  // owns the stripping, so a refresh does not repeat the toast.
+  const oidcError = toSearchParams(search).get('oidc_error')
+  const notifiedError = useRef<string | null>(null)
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search)
-    const code = params.get('oidc_error')
-    if (!code) return
-    const friendly = OIDC_ERROR_KEYS[code]
+    if (!oidcError || notifiedError.current === oidcError) return
+    notifiedError.current = oidcError
+    const friendly = OIDC_ERROR_KEYS[oidcError]
     toast({
       variant: 'destructive',
       title: t('auth.ssoFailed', 'Single sign-on failed'),
@@ -154,17 +149,10 @@ export function UserAuthForm({ className, ...props }: UserAuthFormProps) {
         : t(
             'auth.ssoFailedDesc',
             'The identity provider returned: {{code}}',
-            { code },
+            { code: oidcError },
           ),
     })
-    params.delete('oidc_error')
-    const query = params.toString()
-    window.history.replaceState(
-      null,
-      '',
-      `${window.location.pathname}${query ? `?${query}` : ''}${window.location.hash}`,
-    )
-  }, [t])
+  }, [oidcError, t])
 
   // Enterprise LDAP: the form authenticates against the directory (default
   // when enabled); a link lets the user fall back to their local account.
@@ -280,8 +268,15 @@ export function UserAuthForm({ className, ...props }: UserAuthFormProps) {
     runSubmit({ ...form.getValues(), code })
   }
 
+  // Mid-handoff, or about to leave for the provider: the password form would
+  // only invite the user to type into it.
+  if (sso.phase !== 'form') {
+    return <SsoInterstitial sso={sso} className={className} {...props} />
+  }
+
   return (
     <div className={cn('grid gap-6', className)} {...props}>
+      <SsoBlockedNotice sso={sso} />
       <Form {...form}>
         {/* The TOTP step stays outside any <form>: with the sign-in fields
             gone, a password manager would otherwise read this lone field as
@@ -366,7 +361,7 @@ export function UserAuthForm({ className, ...props }: UserAuthFormProps) {
                 {t('auth.login')}
               </Button>
 
-              {isPro && (
+              {(isPro || ssoSupported) && (
                 <>
                   <Button
                     variant='outline'
@@ -388,7 +383,7 @@ export function UserAuthForm({ className, ...props }: UserAuthFormProps) {
                           title: t('auth.ssoUnavailable'),
                         })
                       } else {
-                        window.location.href = resolveApiUrl('/api/auth/oidc/login')
+                        sso.startSso()
                       }
                     }}
                   >

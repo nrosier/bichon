@@ -31,7 +31,7 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 export default function Settings() {
   const { t } = useTranslation()
   const { canGlobal } = useCurrentUser()
-  const { isPro, isEnterprise } = useEdition()
+  const { isPro, isEnterprise, ssoSupported } = useEdition()
 
 
   // Grouped so the growing list stays scannable. Every entry lands in
@@ -81,7 +81,7 @@ export default function Settings() {
       href: '/settings/sso',
       icon: <Fingerprint size={18} />,
       group: groups.authentication,
-      visible: isPro && (canGlobal('system:root') || canGlobal('user:manage')),
+      visible: (isPro || ssoSupported) && (canGlobal('system:root') || canGlobal('user:manage')),
     },
     {
       title: t('settings.sidebar.ldap', 'LDAP'),
