@@ -26,6 +26,7 @@
 //! - [`config`]: the validated view of the `BICHON_OIDC_*` settings.
 //! - [`discovery`]: cached `.well-known/openid-configuration` fetch.
 //! - [`jwks`]: cached signing-key set, looked up by `kid`.
+//! - [`status`]: cached, single-flighted provider health probe.
 //! - [`jwt`]: ID token signature and claim verification.
 //! - [`store`]: short-lived in-memory pending-auth and handoff state.
 //! - [`user`]: mapping an verified identity onto a Bichon user.
@@ -37,6 +38,7 @@ pub mod flow;
 pub mod jwks;
 pub mod jwt;
 pub mod settings;
+pub mod status;
 pub mod store;
 pub mod user;
 
@@ -45,6 +47,16 @@ pub use settings::{
     apply_update, empty_view, invalidate_stored_cache, load_stored, save_stored, SsoConfigView,
     SsoStoredConfig, SsoUpdate, SsoValidationError,
 };
+
+pub use status::{status, SsoStatus};
+
+/// Clear the discovery, JWKS and status caches, e.g. after the SSO settings
+/// change, so the next request sees the new provider.
+pub async fn invalidate_all() {
+    discovery::invalidate_cache().await;
+    jwks::invalidate_cache().await;
+    status::invalidate_cache().await;
+}
 
 /// Value stored in [`crate::users::BichonUserV2::sso_provider`] for users
 /// authenticated through this module.
