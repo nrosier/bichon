@@ -26,6 +26,8 @@ use crate::error::BichonResult;
 use crate::raise_error;
 use crate::settings::cli::SETTINGS;
 
+use super::settings::{load_stored, SsoStoredConfig};
+
 /// Path the callback handler is mounted at, relative to `BICHON_BASE_URL`.
 ///
 /// The provider must send the browser here, so this is also what a derived
@@ -39,7 +41,7 @@ const DEFAULT_ROLE_ID: u64 = 100200000000000;
 ///
 /// Constructing one of these is the single place that decides whether OIDC is
 /// usable, so handlers never have to re-check individual settings.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct OidcConfig {
     /// Issuer URL with any trailing slash removed. The discovery document is
     /// fetched from `{issuer_url}/.well-known/openid-configuration` and the
@@ -59,6 +61,28 @@ pub struct OidcConfig {
     /// Adopt an existing Bichon account whose email matches the one the provider
     /// asserts. Off by default: see [`crate::oidc::user::resolve_or_provision`].
     pub link_by_email: bool,
+    /// Lowercased, normalized email domains allowed to sign in. Empty means no
+    /// restriction. Comes from the stored SSO document only; env-only setups
+    /// leave it empty.
+    pub allowed_email_domains: Vec<String>,
+}
+
+impl std::fmt::Debug for OidcConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OidcConfig")
+            .field("issuer_url", &self.issuer_url)
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .field("redirect_uri", &self.redirect_uri)
+            .field("default_role_id", &self.default_role_id)
+            .field("auto_redirect", &self.auto_redirect)
+            .field("link_by_email", &self.link_by_email)
+            .field("allowed_email_domains", &self.allowed_email_domains)
+            .finish()
+    }
 }
 
 impl OidcConfig {
@@ -67,22 +91,27 @@ impl OidcConfig {
     /// Returns `MissingConfiguration` when SSO is off or a required value is
     /// absent, so the error message doubles as operator-facing diagnostics.
     pub fn load() -> BichonResult<Self> {
-        if !SETTINGS.bichon_oidc_enabled {
+        // A stored document (saved from the SSO settings UI) overrides the six
+        // UI-managed values wholesale; otherwise they come from the environment.
+        let src = load_stored().unwrap_or_else(env_fields);
+
+        if !src.enabled {
             return Err(raise_error!(
-                "OIDC single sign-on is disabled. Set BICHON_OIDC_ENABLED=true to enable it."
+                "OIDC single sign-on is disabled. Enable it in the SSO settings or set \
+                 BICHON_OIDC_ENABLED=true."
                     .into(),
                 ErrorCode::MissingConfiguration
             ));
         }
 
-        let issuer_url = required(&SETTINGS.bichon_oidc_issuer_url, "BICHON_OIDC_ISSUER_URL")?;
-        let client_id = required(&SETTINGS.bichon_oidc_client_id, "BICHON_OIDC_CLIENT_ID")?;
+        let issuer_url = required(&src.issuer_url, "BICHON_OIDC_ISSUER_URL")?;
+        let client_id = required(&src.client_id, "BICHON_OIDC_CLIENT_ID")?;
 
         let expected_path = callback_path(&SETTINGS.bichon_base_url);
         // Derived rather than required: the callback lives at a fixed path, so
         // the public URL is enough to name it. An operator only has to set
         // BICHON_OIDC_REDIRECT_URI when Bichon is reached under some other name.
-        let redirect_uri = match optional(&SETTINGS.bichon_oidc_redirect_uri) {
+        let redirect_uri = match optional(&src.redirect_uri) {
             Some(configured) => configured,
             None => format!(
                 "{}{}",
@@ -94,12 +123,7 @@ impl OidcConfig {
 
         check_issuer_url(&issuer_url, allow_insecure_issuer()?)?;
 
-        let client_secret = SETTINGS
-            .bichon_oidc_client_secret
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned);
+        let client_secret = optional(&src.client_secret);
 
         Ok(Self {
             // Trimmed so `{issuer}/.well-known/...` never doubles the slash and
@@ -111,6 +135,7 @@ impl OidcConfig {
             default_role_id: default_role_id()?,
             auto_redirect: auto_redirect()?,
             link_by_email: link_by_email()?,
+            allowed_email_domains: src.allowed_email_domains.clone(),
         })
     }
 
@@ -118,6 +143,34 @@ impl OidcConfig {
     pub fn discovery_url(&self) -> String {
         format!("{}/.well-known/openid-configuration", self.issuer_url)
     }
+}
+
+/// The UI-managed settings as the environment currently defines them.
+fn env_fields() -> SsoStoredConfig {
+    SsoStoredConfig {
+        enabled: SETTINGS.bichon_oidc_enabled,
+        issuer_url: optional(&SETTINGS.bichon_oidc_issuer_url),
+        client_id: optional(&SETTINGS.bichon_oidc_client_id),
+        client_secret: optional(&SETTINGS.bichon_oidc_client_secret),
+        redirect_uri: optional(&SETTINGS.bichon_oidc_redirect_uri),
+        allowed_email_domains: Vec::new(),
+        updated_at: 0,
+    }
+}
+
+/// Environment-derived config with the redirect URI defaulted the way
+/// [`OidcConfig::load`] does. The base an update is merged into when nothing
+/// is stored yet.
+pub fn env_effective() -> SsoStoredConfig {
+    let mut cfg = env_fields();
+    if cfg.redirect_uri.is_none() {
+        cfg.redirect_uri = Some(format!(
+            "{}{}",
+            SETTINGS.bichon_public_url.trim_end_matches('/'),
+            callback_path(&SETTINGS.bichon_base_url)
+        ));
+    }
+    cfg
 }
 
 /// The callback path a browser must reach, including the configured UI base path.
@@ -137,7 +190,7 @@ pub fn callback_path(base_url: &str) -> String {
 /// is how the flow is usually developed against. Everything else needs
 /// `BICHON_OIDC_ALLOW_INSECURE_ISSUER=true`, which exists so a working LAN
 /// deployment is not broken by an upgrade — the operator has to say so.
-fn check_issuer_url(value: &str, allow_insecure: bool) -> BichonResult<()> {
+pub(super) fn check_issuer_url(value: &str, allow_insecure: bool) -> BichonResult<()> {
     let url = Url::parse(value).map_err(|e| {
         raise_error!(
             format!(
@@ -208,7 +261,7 @@ fn is_loopback(url: &Url) -> bool {
 /// on the sign-in page would bounce back to the provider forever. The server
 /// forwards such a callback to the right endpoint, so this only warns — but the
 /// warning is the one place an operator learns the value is wrong.
-fn check_redirect_uri(value: &str, expected_path: &str) -> BichonResult<()> {
+pub(super) fn check_redirect_uri(value: &str, expected_path: &str) -> BichonResult<()> {
     let url = Url::parse(value).map_err(|e| {
         raise_error!(
             format!(
@@ -316,7 +369,7 @@ fn link_by_email() -> BichonResult<bool> {
 }
 
 /// `BICHON_OIDC_ALLOW_INSECURE_ISSUER`: permit a non-loopback `http://` issuer.
-fn allow_insecure_issuer() -> BichonResult<bool> {
+pub(super) fn allow_insecure_issuer() -> BichonResult<bool> {
     env_bool("BICHON_OIDC_ALLOW_INSECURE_ISSUER")
 }
 
@@ -349,6 +402,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn debug_redacts_the_client_secret() {
+        let config = OidcConfig {
+            issuer_url: "https://idp.example.com".into(),
+            client_id: "bichon".into(),
+            client_secret: Some("s3cr3t-unit-value".into()),
+            redirect_uri: "https://mail.example.com/api/auth/oidc/callback".into(),
+            default_role_id: 1,
+            auto_redirect: false,
+            link_by_email: false,
+            allowed_email_domains: vec![],
+        };
+        let out = format!("{config:?}");
+        assert!(!out.contains("s3cr3t-unit-value"), "{out}");
+        assert!(out.contains("<redacted>"), "{out}");
+        assert!(format!(
+            "{:?}",
+            OidcConfig {
+                client_secret: None,
+                ..config
+            }
+        )
+        .contains("client_secret: None"));
+    }
+
+    #[test]
     fn fork_only_settings_fall_back_to_their_defaults() {
         // Unset means "behave as before the setting existed", which is what an
         // upstream resync leaves an existing deployment with. For the two
@@ -365,9 +443,17 @@ mod tests {
 
     #[test]
     fn fork_only_settings_parse_what_an_operator_writes() {
-        assert_eq!(parse_role_id(Some("100200000000001")).unwrap(), 100200000000001);
+        assert_eq!(
+            parse_role_id(Some("100200000000001")).unwrap(),
+            100200000000001
+        );
         for (raw, expected) in [("true", true), ("TRUE", true), ("false", false)] {
-            assert_eq!(parse_bool("SETTING", Some(raw)).unwrap(), expected, "{}", raw);
+            assert_eq!(
+                parse_bool("SETTING", Some(raw)).unwrap(),
+                expected,
+                "{}",
+                raw
+            );
         }
     }
 

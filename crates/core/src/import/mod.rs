@@ -42,6 +42,30 @@ const MAX_SINGLE_EML_BYTES: usize = 100 * 1024 * 1024;
 pub const MAX_WEB_EML_BYTES: usize = 100 * 1024 * 1024; // 100 MB
 pub const MAX_WEB_MBOX_BYTES: usize = 1024 * 1024 * 1024; // 1 GB
 
+/// Decode one EML payload from the import API.
+///
+/// The API documents "base64", not "URL-safe base64". Decode the URL-safe
+/// alphabet first (that is what the bundled UI and the PST importer send),
+/// then fall back to standard base64. Without the fallback a standard encoder
+/// fails intermittently: `+` and `/` only appear in some payloads, so short
+/// messages often work while a message whose bytes happen to need those
+/// symbols fails.
+fn decode_eml_base64(input: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    match base64_decode_url_safe!(input.as_bytes()) {
+        Ok(bytes) => Ok(bytes),
+        Err(url_safe_error) => {
+            use base64::{engine::general_purpose::STANDARD, Engine as _};
+            STANDARD
+                .decode(input.as_bytes())
+                .or_else(|_| {
+                    use base64::engine::general_purpose::STANDARD_NO_PAD;
+                    STANDARD_NO_PAD.decode(input.as_bytes())
+                })
+                .map_err(|_| url_safe_error)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "web-api", derive(poem_openapi::Object))]
 pub struct BatchEmlRequest {
@@ -80,14 +104,10 @@ pub struct ImportEmls;
 
 impl ImportEmls {
     pub async fn do_import(mut request: BatchEmlRequest) -> BichonResult<BatchEmlResult> {
-        let account = AccountModel::check_account_exists(request.account_id)?;
-
-        if !account.enabled {
-            return Err(raise_error!(
-                "The account is disabled and cannot be used for this operation.".into(),
-                ErrorCode::InvalidParameter
-            ));
-        }
+        // One validator for every import entry point: enabled, plain `NoSync`,
+        // and neither the journal archive nor a view. The EML batch path used
+        // to duplicate part of this inline and missed the journal check.
+        let account = validate_import_account(request.account_id)?;
 
         let mailbox_id = match account.account_type {
             AccountType::IMAP => {
@@ -105,6 +125,14 @@ impl ImportEmls {
                         ErrorCode::ResourceNotFound
                     )),
                 }
+            }
+            // A view is rejected by `validate_import_account`; this arm keeps
+            // the match exhaustive and fails closed if that ever changes.
+            AccountType::View => {
+                return Err(raise_error!(
+                    "Import is not allowed into a view account.".into(),
+                    ErrorCode::InvalidParameter
+                ));
             }
             AccountType::NoSync => {
                 let mailbox = MailBox {
@@ -137,7 +165,7 @@ impl ImportEmls {
         let total = request.emls.len();
         let mut index: usize = 0;
         while let Some(eml_base64) = request.emls.pop() {
-            let decoded = match base64_decode_url_safe!(eml_base64.as_bytes()) {
+            let decoded = match decode_eml_base64(&eml_base64) {
                 Ok(bytes) => bytes,
                 Err(e) => {
                     let error_msg =
@@ -169,7 +197,7 @@ impl ImportEmls {
             }
 
             match extract_envelope_from_eml(&decoded, account_id, mailbox_id).await {
-                Ok(ExtractOutcome::Imported) => {
+                Ok(ExtractOutcome::Imported | ExtractOutcome::Filtered) => {
                     success_count += 1;
                 }
                 Ok(ExtractOutcome::Duplicate) => {
@@ -370,7 +398,8 @@ pub fn detect_text_file(bytes: &[u8]) -> bool {
     printable as f64 / total as f64 >= 0.90
 }
 
-/// Validate that the target account exists, is enabled, and is NoSync type.
+/// Validate that the target account exists, is enabled, and is a plain NoSync
+/// account.
 fn validate_import_account(account_id: u64) -> BichonResult<AccountModel> {
     let account = AccountModel::check_account_exists(account_id)?;
     if !account.enabled {
@@ -386,12 +415,35 @@ fn validate_import_account(account_id: u64) -> BichonResult<AccountModel> {
             ErrorCode::InvalidParameter
         ));
     }
+    // Accounts with a special role have no storage of their own to import
+    // into:
+    //
+    // * A **view** is an authorization/query construct. Its searches are
+    //   expanded to its source accounts and its read checks authorize against
+    //   those sources, so messages written under the view's own account id
+    //   would never be found by a search and never pass a read check — a data
+    //   black hole.
+    // * A **journal** archive is the one complete copy of what the customer's
+    //   mail system journaled. Importing into it would mix foreign mail into
+    //   that record and destroy exactly the provenance the journal exists to
+    //   provide.
+    if account.kind.is_some() {
+        return Err(raise_error!(
+            "Import is not allowed into the journal archive; import into a plain local account instead."
+                .into(),
+            ErrorCode::InvalidParameter
+        ));
+    }
     Ok(account)
 }
 
 /// Resolve or create a mailbox/folder for the given account.
 pub(super) fn resolve_mailbox(account: &AccountModel, folder: &str) -> BichonResult<u64> {
     match account.account_type {
+        AccountType::View => Err(raise_error!(
+            "Import is not allowed into a view account.".into(),
+            ErrorCode::InvalidParameter
+        )),
         AccountType::IMAP => {
             // Shouldn't reach here (validated above), but handle gracefully
             let all_mailboxes = MailBox::list_all(account.id)?;
@@ -680,7 +732,7 @@ fn process_mbox_file(
         match futures::executor::block_on(extract_envelope_from_eml(
             eml_bytes, account_id, mailbox_id,
         )) {
-            Ok(ExtractOutcome::Imported) => {
+            Ok(ExtractOutcome::Imported | ExtractOutcome::Filtered) => {
                 success_count += 1;
             }
             Ok(ExtractOutcome::Duplicate) => {
@@ -756,7 +808,7 @@ fn process_single_eml(
 
     match futures::executor::block_on(extract_envelope_from_eml(eml_bytes, account_id, mailbox_id))
     {
-        Ok(ExtractOutcome::Imported) => (1, 0, vec![]),
+        Ok(ExtractOutcome::Imported | ExtractOutcome::Filtered) => (1, 0, vec![]),
         Ok(ExtractOutcome::Duplicate) => (0, 1, vec![]),
         Err(e) => (
             0,
@@ -935,4 +987,27 @@ fn fail_progress(
     };
     update_progress(import_id, progress.clone());
     history::save_import_history(user_id, account_id, folder, &progress);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_eml_base64;
+    use base64::{
+        engine::general_purpose::{STANDARD, URL_SAFE},
+        Engine as _,
+    };
+
+    #[test]
+    fn accepts_both_the_standard_and_url_safe_base64_alphabets() {
+        // These bytes force the two alphabet-specific symbols: standard
+        // base64 is "+//+", URL-safe is "-__-".
+        let raw = [0xfb_u8, 0xff, 0xfe];
+        let standard = STANDARD.encode(raw);
+        assert!(standard.contains('+') || standard.contains('/'), "{standard}");
+        assert_eq!(decode_eml_base64(&standard).unwrap(), raw.to_vec());
+        assert_eq!(
+            decode_eml_base64(&URL_SAFE.encode(raw)).unwrap(),
+            raw.to_vec()
+        );
+    }
 }

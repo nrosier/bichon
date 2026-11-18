@@ -41,7 +41,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { DataTablePagination } from './data-table-pagination'
+import { DataTablePagination } from '@/components/data-table-pagination'
 import { DataTableToolbar } from './data-table-toolbar'
 import { useTranslation } from 'react-i18next'
 import { AccessToken } from '@/api/users/api'
@@ -62,7 +62,10 @@ interface DataTableProps {
 export function ApiTokensTable({ columns, data }: DataTableProps) {
   const { t } = useTranslation()
   const [rowSelection, setRowSelection] = useState({})
-  const [columnVisibility, setColumnVisibility] = useState<VisibilityState>({})
+  const [columnVisibility, setColumnVisibility] = useState<VisibilityState>({
+    // Filtering-only column, never displayed.
+    metrics_only: false,
+  })
   const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([])
   const [sorting, setSorting] = useState<SortingState>([])
 
@@ -168,7 +171,7 @@ export function ApiTokensTable({ columns, data }: DataTableProps) {
           </TableBody>
         </Table>
       </div>
-      <DataTablePagination table={table} />
+      <DataTablePagination table={table}  storageKey='bichon_apitoken_page_size' />
     </div>
   )
 }

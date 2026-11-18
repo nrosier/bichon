@@ -39,7 +39,7 @@ export function MailDisplayDrawer({ open, onOpenChange }: Props) {
       open={open}
       onOpenChange={onOpenChange}
     >
-      <DialogContent className='w-full md:max-w-6xl mx-auto h-full'>
+      <DialogContent aria-describedby={undefined} className='w-full md:max-w-6xl mx-auto h-full'>
         <div className="flex flex-col h-full overflow-hidden -m-6">
           <DialogHeader className="p-4 pb-3 border-b shrink-0 m-0">
             <div className="flex items-center justify-between">
@@ -48,7 +48,9 @@ export function MailDisplayDrawer({ open, onOpenChange }: Props) {
               </DialogTitle>
             </div>
           </DialogHeader>
-          <ScrollArea className="flex-1">
+          {/* Force Radix's `display: table` content wrapper back to a block so
+              the compact header's truncation works in the drawer too. */}
+          <ScrollArea className="flex-1 [&_[data-radix-scroll-area-viewport]>div]:!block">
             <div className='m-5'>
               {currentEnvelope ? (
                 <MailMessageView envelope={currentEnvelope} />

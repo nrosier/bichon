@@ -40,6 +40,10 @@ function target_keys(target: ApprovalTarget): string[] {
   switch (target.kind) {
     case 'accounts':
       return target.account_ids.map((id) => `account:${id}`)
+    case 'hold_case':
+      // Keyed on the case, not the account: releasing MATTER-1 must not
+      // disable the row for MATTER-2.
+      return [`hold:${target.hold_id}`]
     case 'users':
       return target.user_ids.map((id) => `user:${id}`)
     case 'mailbox':
@@ -58,6 +62,28 @@ function target_keys(target: ApprovalTarget): string[] {
       // keeps a queued revocation from blocking the token list's own delete
       // button for every other token that user owns.
       return [`token:${target.fingerprint}`]
+    case 'export':
+      // Keyed on the saved search, not on the accounts: the export is
+      // identified by the search it runs, and queuing two exports of the same
+      // search is the duplicate this hook exists to prevent. Two *different*
+      // searches overlapping in scope are two different exports, and blocking
+      // the second would be wrong — an investigator exporting one search must
+      // not be locked out of exporting another.
+      return [`export:${target.saved_search_id}`]
+    case 'erasure':
+      // Keyed per message, like a deletion, so the same bulk action can ask
+      // "how many of the selected messages are already spoken for". The op is
+      // part of the key at the call site, so a queued *deletion* does not block
+      // asking for an erasure record of the same message — the two are
+      // different requests, and the erasure is the one that carries the
+      // assessment.
+      return Object.entries(target.by_account).flatMap(([account, ids]) =>
+        ids.map((id) => `message:${account}:${id}`)
+      )
+    case 'retention':
+      // One policy per account: two queued changes to the same account could
+      // otherwise overwrite each other in either order.
+      return [`retention:${target.account_id}`]
   }
 }
 

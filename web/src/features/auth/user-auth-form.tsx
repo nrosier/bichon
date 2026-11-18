@@ -17,7 +17,15 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 
-import { HTMLAttributes, useState } from 'react'
+import {
+  HTMLAttributes,
+  forwardRef,
+  useEffect,
+  useRef,
+  useState,
+  type ComponentProps,
+  type ReactNode,
+} from 'react'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { cn, toSearchParams } from '@/lib/utils'
@@ -32,7 +40,8 @@ import {
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { PasswordInput } from '@/components/password-input'
-import { useMutation } from '@tanstack/react-query'
+import { OtpInput } from '@/components/otp-input'
+import { useMutation, useQuery } from '@tanstack/react-query'
 import { setToken } from '@/stores/authStore'
 import { toast } from '@/hooks/use-toast'
 import { AxiosError } from 'axios'
@@ -41,13 +50,60 @@ import { useLocation, useNavigate } from '@tanstack/react-router'
 import { Button } from '@/components/button'
 import { useTranslation } from 'react-i18next'
 import i18n from '@/i18n'
-import { KeyRound, Loader2, LogIn } from 'lucide-react'
+import { SsoBlockedNotice, SsoInterstitial, useSsoSignIn } from '@/sso'
+import { SSO_ERROR_KEYS } from '@/sso/locales'
+
+/** Plain-language text for the OIDC error codes the server redirects with.
+ *  The fork's stable codes (`sso.error.<code>`) are merged over upstream's
+ *  map. Unknown codes fall back to showing the raw code. */
+const OIDC_ERROR_KEYS: Record<string, string> = {
+  license_required: 'auth.ssoErrLicense',
+  // Same codes upstream mapped, now covered by `sso.error.<code>` below.
+  ...SSO_ERROR_KEYS,
+}
+import { KeyRound, Loader2, Lock, LogIn, Shield, User } from 'lucide-react'
 import { ldapLogin, login, mfaVerify, type LoginResult } from '@/api/users/api'
-import { useEdition } from '@/hooks/use-edition'
+import { get_sso_status } from '@/api/sso/api'
 import { useTheme } from '@/context/theme-context'
-import { SsoBlockedNotice, SsoInterstitial, SsoSignIn, useSsoSignIn } from '@/sso'
+import { isTheme } from '@/lib/theme'
+import { useEdition } from '@/hooks/use-edition'
 
 type UserAuthFormProps = HTMLAttributes<HTMLDivElement>
+
+/** Input with a leading icon; the ref goes to the input so FormControl can
+ *  still wire the label and the field. */
+const IconField = forwardRef<
+  HTMLInputElement,
+  ComponentProps<typeof Input> & { icon: ReactNode }
+>(({ icon, className, ...props }, ref) => (
+  <div className='relative'>
+    <span className='pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground'>
+      {icon}
+    </span>
+    <Input ref={ref} className={cn('pl-9', className)} {...props} />
+  </div>
+))
+IconField.displayName = 'IconField'
+
+/** The password input already owns a ref for react-hook-form; the lock icon
+ *  sits above its wrapper and the inner input gets the left padding. */
+const PasswordField = forwardRef<
+  HTMLInputElement,
+  ComponentProps<typeof PasswordInput>
+>(({ className, ...props }, ref) => (
+  <div className='relative'>
+    <Lock
+      size={16}
+      className='pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground'
+    />
+    <PasswordInput
+      ref={ref}
+      className={cn('[&_input]:pl-9', className)}
+      {...props}
+    />
+  </div>
+))
+PasswordField.displayName = 'PasswordField'
 
 export function UserAuthForm({ className, ...props }: UserAuthFormProps) {
   const [isLoading, setIsLoading] = useState(false)
@@ -57,9 +113,47 @@ export function UserAuthForm({ className, ...props }: UserAuthFormProps) {
   const { t } = useTranslation()
   const { search } = useLocation();
   const redirect = toSearchParams(search).get('redirect') || '/';
-
   const sso = useSsoSignIn(redirect)
-  const { ldapEnabled } = useEdition()
+
+  const { isPro, ssoSupported, ssoEnabled, ldapEnabled } = useEdition()
+
+  // Ask whether the configured provider is actually reachable. A down IdP
+  // used to be visible only in the server log: the page offered the button
+  // and sent the user to a raw error page. The server caches the probe, so
+  // this is one cheap request per page load.
+  const { data: ssoStatus } = useQuery({
+    queryKey: ['sso-status'],
+    queryFn: get_sso_status,
+    enabled: ssoEnabled,
+    staleTime: 30_000,
+    retry: 0,
+  })
+  const ssoUnavailable = ssoStatus !== undefined && !ssoStatus.available
+
+  // The OIDC callback redirects back here with ?oidc_error=<code>. Surface it
+  // once. The code is read from the router's location at render time, not from
+  // `window.location`: `useSsoSignIn` strips the param from the URL in an effect
+  // that runs before this one, so the URL no longer has it by then. The hook
+  // owns the stripping, so a refresh does not repeat the toast.
+  const oidcError = toSearchParams(search).get('oidc_error')
+  const notifiedError = useRef<string | null>(null)
+  useEffect(() => {
+    if (!oidcError || notifiedError.current === oidcError) return
+    notifiedError.current = oidcError
+    const friendly = OIDC_ERROR_KEYS[oidcError]
+    toast({
+      variant: 'destructive',
+      title: t('auth.ssoFailed', 'Single sign-on failed'),
+      description: friendly
+        ? t(friendly, { status: '-' })
+        : t(
+            'auth.ssoFailedDesc',
+            'The identity provider returned: {{code}}',
+            { code: oidcError },
+          ),
+    })
+  }, [oidcError, t])
+
   // Enterprise LDAP: the form authenticates against the directory (default
   // when enabled); a link lets the user fall back to their local account.
   const [loginMode, setLoginMode] = useState<'local' | 'ldap'>(
@@ -77,9 +171,9 @@ export function UserAuthForm({ className, ...props }: UserAuthFormProps) {
   })
 
   const mutation = useMutation({
-    mutationFn: (data: Record<string, any>) => {
+    mutationFn: (data: LoginFormValues) => {
       if (mfaChallenge) {
-        return mfaVerify(mfaChallenge, data.code)
+        return mfaVerify(mfaChallenge, data.code ?? '')
       }
       if (loginMode === 'ldap') {
         return ldapLogin({
@@ -102,7 +196,7 @@ export function UserAuthForm({ className, ...props }: UserAuthFormProps) {
     if (result.success && result.access_token) {
       setToken(result);
 
-      if (result.theme) {
+      if (isTheme(result.theme)) {
         setTheme(result.theme);
       }
 
@@ -114,15 +208,8 @@ export function UserAuthForm({ className, ...props }: UserAuthFormProps) {
     }
   }
 
-  async function onSubmit(data: LoginFormValues) {
-    if (mfaChallenge && (!data.code || data.code.trim().length !== 6)) {
-      toast({
-        variant: "destructive",
-        title: t('auth.mfaCodeRequired', 'Please enter the 6-digit code from your authenticator app.'),
-      })
-      return
-    }
-
+  function runSubmit(data: LoginFormValues) {
+    if (isLoading) return
     setIsLoading(true)
 
     mutation.mutate(data, {
@@ -162,6 +249,27 @@ export function UserAuthForm({ className, ...props }: UserAuthFormProps) {
     });
   }
 
+  async function onSubmit(data: LoginFormValues) {
+    if (mfaChallenge && (!data.code || data.code.trim().length !== 6)) {
+      toast({
+        variant: "destructive",
+        title: t('auth.mfaCodeRequired', 'Please enter the 6-digit code from your authenticator app.'),
+      })
+      return
+    }
+
+    runSubmit(data)
+  }
+
+  // The sixth digit verifies immediately; the button stays as the fallback for
+  // editing an already-complete code and submitting it again.
+  function submitCode(code: string) {
+    if (code.length !== 6 || isLoading) return
+    runSubmit({ ...form.getValues(), code })
+  }
+
+  // Mid-handoff, or about to leave for the provider: the password form would
+  // only invite the user to type into it.
   if (sso.phase !== 'form') {
     return <SsoInterstitial sso={sso} className={className} {...props} />
   }
@@ -170,97 +278,144 @@ export function UserAuthForm({ className, ...props }: UserAuthFormProps) {
     <div className={cn('grid gap-6', className)} {...props}>
       <SsoBlockedNotice sso={sso} />
       <Form {...form}>
-        <form onSubmit={form.handleSubmit(onSubmit)}>
-          <div className='grid gap-2'>
-            {mfaChallenge ? (
-              <>
-                <p className='text-sm text-muted-foreground'>
-                  {t('auth.mfaLoginDesc', 'Enter the 6-digit code shown in your authenticator app to finish signing in.')}
-                </p>
-                <FormField
-                  control={form.control}
-                  name='code'
-                  render={({ field }) => (
-                    <FormItem className='space-y-1'>
-                      <FormLabel>{t('auth.mfaCodePlaceholder', 'Authentication code')}</FormLabel>
-                      <FormControl>
-                        <Input
-                          inputMode='numeric'
-                          autoComplete='off'
-                          maxLength={6}
-                          placeholder='000000'
-                          className='text-center text-lg tracking-[0.5em]'
-                          {...field}
-                        />
-                      </FormControl>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
-              </>
-            ) : (
-              <>
-                <FormField
-                  control={form.control}
-                  name='username'
-                  render={({ field }) => (
-                    <FormItem className='space-y-1'>
-                      <FormLabel>{t('auth.username')}</FormLabel>
-                      <FormControl>
-                        <Input autoComplete='username' {...field} />
-                      </FormControl>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
-                <FormField
-                  control={form.control}
-                  name='password'
-                  render={({ field }) => (
-                    <FormItem className='space-y-1'>
-                      <div className='flex items-center justify-between'>
-                        <FormLabel>{t('auth.password')}</FormLabel>
-                      </div>
-                      <FormControl>
-                        <PasswordInput autoComplete='current-password' placeholder='********' {...field} />
-                      </FormControl>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
-                <Button className='mt-2 w-full' disabled={isLoading}>
-                  {isLoading ? <Loader2 className='animate-spin' /> : <LogIn size={16} className='mr-2' />}
-                  {t('auth.login')}
-                </Button>
-
-                <SsoSignIn sso={sso} disabled={isLoading} />
-
-                {/* `ldapEnabled` already means "Enterprise + flag set" — the
-                    server folds the license into it so the form can never
-                    offer a mode the login endpoint would refuse. */}
-                {ldapEnabled && (
-                  <Button
-                    variant='link'
-                    className='mt-2 w-full'
-                    type='button'
-                    onClick={() => setLoginMode((m) => (m === 'ldap' ? 'local' : 'ldap'))}
-                  >
-                    {loginMode === 'ldap'
-                      ? t('auth.localLogin', 'Sign in with your local account')
-                      : t('auth.ldapLogin', 'Sign in with LDAP')}
-                  </Button>
-                )}
-              </>
-            )}
-
-            {mfaChallenge && (
-              <Button className='mt-2 w-full' disabled={isLoading}>
-                {isLoading ? <Loader2 className='animate-spin' /> : <KeyRound size={16} className='mr-2' />}
-                {t('auth.mfaVerify', 'Verify')}
-              </Button>
-            )}
+        {/* The TOTP step stays outside any <form>: with the sign-in fields
+            gone, a password manager would otherwise read this lone field as
+            part of the login form and fill it on load. */}
+        {mfaChallenge ? (
+          <div className='grid gap-5'>
+            <p className='text-sm text-muted-foreground'>
+              {t('auth.mfaLoginDesc', 'Enter the 6-digit code shown in your authenticator app to finish signing in.')}
+            </p>
+            <FormField
+              control={form.control}
+              name='code'
+              render={({ field }) => (
+                <FormItem className='space-y-2'>
+                  <FormLabel>{t('auth.mfaCodePlaceholder', 'Authentication code')}</FormLabel>
+                  <FormControl>
+                    <OtpInput
+                      value={field.value ?? ''}
+                      onChange={(value) => {
+                        field.onChange(value)
+                        if (value.length === 6) submitCode(value)
+                      }}
+                      autoFocus
+                      className='justify-center py-1'
+                    />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+            <Button
+              type='button'
+              size='lg'
+              className='mt-1 w-full'
+              disabled={isLoading}
+              onClick={() => form.handleSubmit(onSubmit)()}
+            >
+              {isLoading ? <Loader2 className='animate-spin' /> : <KeyRound size={16} className='mr-2' />}
+              {t('auth.mfaVerify', 'Verify')}
+            </Button>
           </div>
-        </form>
+        ) : (
+          <form onSubmit={form.handleSubmit(onSubmit)}>
+            <div className='grid gap-5'>
+              <FormField
+                control={form.control}
+                name='username'
+                render={({ field }) => (
+                  <FormItem className='space-y-2'>
+                    <FormLabel>{t('auth.username')}</FormLabel>
+                    <FormControl>
+                      <IconField
+                        icon={<User size={16} />}
+                        autoFocus
+                        autoComplete='username'
+                        {...field}
+                      />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <FormField
+                control={form.control}
+                name='password'
+                render={({ field }) => (
+                  <FormItem className='space-y-2'>
+                    <FormLabel>{t('auth.password')}</FormLabel>
+                    <FormControl>
+                      <PasswordField
+                        autoComplete='current-password'
+                        placeholder='********'
+                        {...field}
+                      />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <Button size='lg' className='mt-1 w-full' disabled={isLoading}>
+                {isLoading ? <Loader2 className='animate-spin' /> : <LogIn size={16} className='mr-2' />}
+                {t('auth.login')}
+              </Button>
+
+              {(isPro || ssoSupported) && (
+                <>
+                  <Button
+                    variant='outline'
+                    size='lg'
+                    className='w-full'
+                    type='button'
+                    onClick={() => {
+                      if (!ssoEnabled) {
+                        toast({
+                          title: t('auth.ssoNotEnabled'),
+                          description: t('auth.ssoNotEnabledDesc'),
+                        })
+                      } else if (ssoUnavailable) {
+                        // Fresh probe says the provider is down. Navigating
+                        // would just hang and bounce back; tell the user
+                        // now and point them at the local login above.
+                        toast({
+                          variant: 'destructive',
+                          title: t('auth.ssoUnavailable'),
+                        })
+                      } else {
+                        sso.startSso()
+                      }
+                    }}
+                  >
+                    <Shield size={16} className='mr-2' />
+                    {t('auth.ssoLogin')}
+                  </Button>
+                  {ssoUnavailable && (
+                    <p className='text-center text-xs font-medium text-destructive'>
+                      {t('auth.ssoUnavailable')}
+                    </p>
+                  )}
+                </>
+              )}
+
+              {/* `ldapEnabled` already means "Enterprise + flag set" — the
+                  server folds the license into it so the form can never
+                  offer a mode the login endpoint would refuse. */}
+              {ldapEnabled && (
+                <Button
+                  variant='link'
+                  className='w-full'
+                  type='button'
+                  onClick={() => setLoginMode((m) => (m === 'ldap' ? 'local' : 'ldap'))}
+                >
+                  {loginMode === 'ldap'
+                    ? t('auth.localLogin', 'Sign in with your local account')
+                    : t('auth.ldapLogin', 'Sign in with LDAP')}
+                </Button>
+              )}
+            </div>
+          </form>
+        )}
       </Form>
     </div>
   )

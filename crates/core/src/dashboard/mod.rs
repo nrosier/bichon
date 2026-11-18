@@ -41,6 +41,10 @@ use crate::{
     },
 };
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 #[cfg_attr(feature = "web-api", derive(poem_openapi::Object))]
 pub struct DashboardStats {
@@ -50,6 +54,11 @@ pub struct DashboardStats {
     pub total_size_bytes: u64,                           // Total size of all emails (in bytes)
     pub storage_usage_bytes: u64,                        // Actual storage used (in bytes)
     pub index_usage_bytes: u64,                          // Index storage size (in bytes)
+    /// Whether the storage/index figures describe the same account scope as
+    /// `total_size_bytes`. Filesystem usage cannot be attributed per account,
+    /// so it is only meaningful for callers who can see every account.
+    #[serde(default = "default_true")]
+    pub storage_stats_available: bool,
     pub recent_activity: Vec<TimeBucket>,                // Email activity over recent days
     pub top_senders: Vec<Group>,                         // Top 10 senders
     pub top_accounts: Vec<Group>,                        // Top 10 accounts
@@ -62,11 +71,21 @@ pub struct DashboardStats {
 
 impl DashboardStats {
     pub async fn get(context: ClientContext) -> BichonResult<Self> {
-        let has_all_accounts = context.has_permission(None, Permission::ACCOUNT_MANAGE_ALL);
+        // Unrestricted for a caller who administers every account *or* may read
+        // every account — the two globals the other account-level endpoints
+        // accept. `access::aggregate_accounts` only knows the second one, so
+        // the first is decided here.
+        let has_all_accounts = context.has_permission(None, Permission::ACCOUNT_MANAGE_ALL)
+            || context.has_permission(None, Permission::DATA_READ_ALL);
+        // Views are expanded: a view owns no documents, so aggregating over its
+        // id alone reported an empty archive to every viewer. Every figure
+        // below is account-level — none of them can evaluate a view source's
+        // participant filter — so a *filtered* source counts for nothing rather
+        // than for its whole account; see `access::aggregate_accounts`.
         let authorized_ids: Option<HashSet<u64>> = if has_all_accounts {
             None
         } else {
-            Some(context.user.account_access_map.keys().cloned().collect())
+            crate::account::access::aggregate_accounts(&context)?
         };
 
         let mut stat = ENVELOPE_MANAGER.get_dashboard_stats(&authorized_ids)?;
@@ -78,16 +97,25 @@ impl DashboardStats {
         stat.account_count = if has_all_accounts {
             AccountModel::count()?
         } else {
+            // The accounts counted are the same ones the figures cover, so a
+            // viewer whose only access is a filtered view sees "0 accounts and
+            // 0 messages" rather than "1 account and 0 messages".
             authorized_ids.as_ref().map(|ids| ids.len()).unwrap_or(0)
         };
 
         stat.email_count = ENVELOPE_MANAGER.total_emails(&authorized_ids)?;
         stat.attachment_count = ATTACHMENT_MANAGER.total_attachments(&authorized_ids)?;
-        stat.storage_usage_bytes = get_total_size(&DATA_DIR_MANAGER.storage_dir)
-            .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
-
-        stat.index_usage_bytes = get_total_size(&&DATA_DIR_MANAGER.envelope_dir)
-            .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
+        stat.storage_stats_available = has_all_accounts;
+        if has_all_accounts {
+            // Every file under `blobs` is email/attachment storage.
+            stat.storage_usage_bytes = get_total_size(&DATA_DIR_MANAGER.blob_dir())
+                .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
+            // Everything under `bichon-indices` is index storage (mail and
+            // attachment metadata today, any future index included). The
+            // compression ratio itself uses only the blob figure above.
+            stat.index_usage_bytes = get_total_size(&DATA_DIR_MANAGER.index_dir)
+                .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
+        }
 
         stat.system_version = bichon_version!().to_string();
 

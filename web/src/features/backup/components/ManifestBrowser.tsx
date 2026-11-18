@@ -51,9 +51,15 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Separator } from '@/components/ui/separator'
+
+/** Minimum spacing between user-triggered list refreshes. Listing restore
+ *  points is a request against the backup target (billable on S3), so a burst
+ *  of clicks must not turn into a burst of list calls. */
+const MANUAL_REFRESH_COOLDOWN_MS = 10_000
 
 const getErrorMessage = (error: unknown) => {
   if (error instanceof AxiosError) {
@@ -119,19 +125,39 @@ interface ManifestBrowserProps {
   /** Compact mode for the page's side column: the list and detail stack
    *  vertically instead of side by side, and the picker stretches. */
   stacked?: boolean
+  /** True when a backup run may have committed a restore point since the list
+   *  was last fetched. Shown as a badge; the list itself is only refetched on
+   *  user request. */
+  stale?: boolean
+  /** Called after the list has been successfully refetched. */
+  onRefreshed?: () => void
 }
 
 /** Browse restore points: pick a manifest, see its object composition, and
  * download the audit delta chain as gzip JSONL (the timestamped compliance
  * export artifact). Restore points can be deleted (the objects only they
- * reference are reclaimed from the bucket); restore itself is deliberately
+ * reference are reclaimed from the target); restore itself is deliberately
  * left to the CLI. On Pro/Enterprise a restore-drill button verifies a
  * restore point against the target without writing anything. */
-export default function ManifestBrowser({ stacked = false }: ManifestBrowserProps) {
+export default function ManifestBrowser({
+  stacked = false,
+  stale = false,
+  onRefreshed,
+}: ManifestBrowserProps) {
   const { t } = useTranslation()
   const { isPro } = useEdition()
   const [manifests, setManifests] = React.useState<ManifestView[]>([])
   const [loading, setLoading] = React.useState(true)
+  const [refreshing, setRefreshing] = React.useState(false)
+  const inFlightRef = React.useRef(false)
+  const lastManualRefreshRef = React.useRef(0)
+  // Keep the latest callback in a ref so it does not become an effect
+  // dependency — the parent re-renders on every poll, and an inline callback
+  // would otherwise refetch the list every few seconds.
+  const onRefreshedRef = React.useRef(onRefreshed)
+  React.useEffect(() => {
+    onRefreshedRef.current = onRefreshed
+  }, [onRefreshed])
   const [selectedId, setSelectedId] = React.useState<string | null>(null)
   const [detail, setDetail] = React.useState<ManifestView | null>(null)
   const [detailLoading, setDetailLoading] = React.useState(false)
@@ -151,6 +177,7 @@ export default function ManifestBrowser({ stacked = false }: ManifestBrowserProp
       const data = await listBackupManifests()
       setManifests(data)
       setError(null)
+      onRefreshedRef.current?.()
       if (!data.length) {
         setSelectedId(null)
         setDetail(null)
@@ -165,6 +192,40 @@ export default function ManifestBrowser({ stacked = false }: ManifestBrowserProp
   React.useEffect(() => {
     refreshManifests()
   }, [refreshManifests])
+
+  /** User-triggered refresh, rate-limited: a list call goes to the backup
+   *  target and costs a request (S3 bills per 1,000 list calls), so repeated
+   *  clicks within the cooldown window are rejected. */
+  const handleManualRefresh = async () => {
+    if (inFlightRef.current) return
+    const elapsed = Date.now() - lastManualRefreshRef.current
+    if (
+      lastManualRefreshRef.current > 0 &&
+      elapsed < MANUAL_REFRESH_COOLDOWN_MS
+    ) {
+      toast({
+        title: t(
+          'backup.refreshTooSoon',
+          'Please wait {{seconds}}s before refreshing again',
+          { seconds: Math.ceil((MANUAL_REFRESH_COOLDOWN_MS - elapsed) / 1000) }
+        ),
+        description: t(
+          'backup.refreshTooSoonHint',
+          'Listing restore points sends a request to the backup target.'
+        ),
+      })
+      return
+    }
+    inFlightRef.current = true
+    lastManualRefreshRef.current = Date.now()
+    setRefreshing(true)
+    try {
+      await refreshManifests(true)
+    } finally {
+      inFlightRef.current = false
+      setRefreshing(false)
+    }
+  }
 
   const handleSelect = async (id: string) => {
     setSelectedId(id)
@@ -236,7 +297,7 @@ export default function ManifestBrowser({ stacked = false }: ManifestBrowserProp
           objects: result.objects_removed,
           bytes: formatBytes(result.bytes_reclaimed),
           defaultValue:
-            '{{objects}} object(s) removed, {{bytes}} freed from the bucket',
+            '{{objects}} object(s) removed, {{bytes}} freed from the target',
         }),
       })
       setDeleteTarget(null)
@@ -280,30 +341,47 @@ export default function ManifestBrowser({ stacked = false }: ManifestBrowserProp
       <div className='flex flex-wrap items-center justify-between gap-2'>
         <div className='flex min-w-0 flex-1 items-center gap-2'>
           {!stacked && (
-            <span className='text-sm font-medium'>
+            <span className='text-xs font-medium'>
               {t('backup.manifestBrowser', 'Restore points')}
             </span>
           )}
+          {stale && (
+            <Badge
+              variant='outline'
+              className='border-amber-500/50 text-xs text-amber-600 dark:text-amber-500'
+            >
+              {t('backup.staleRestorePoints', 'New backup available')}
+            </Badge>
+          )}
           <Button
-            variant='ghost'
-            size='icon'
-            className='ml-auto h-8 w-8'
-            title={t('backup.refresh')}
-            onClick={() => refreshManifests(true)}
+            variant='outline'
+            size='sm'
+            className='ml-auto h-8 gap-1 px-2 text-xs'
+            title={t(
+              'backup.refreshHint',
+              'Refresh the restore-point list (sends a request to the backup target)'
+            )}
+            onClick={handleManualRefresh}
+            disabled={refreshing}
           >
-            <RefreshCw className='h-4 w-4' />
+            {refreshing ? (
+              <Loader2 className='h-3.5 w-3.5 animate-spin' />
+            ) : (
+              <RefreshCw className='h-3.5 w-3.5' />
+            )}
+            {t('backup.refresh')}
           </Button>
         </div>
       </div>
       <Separator />
       {error ? (
-        <div className='py-8 text-center text-sm text-destructive'>{error}</div>
+        <div className='py-8 text-center text-xs text-destructive'>{error}</div>
       ) : loading ? (
         <div className='flex items-center justify-center py-10'>
           <Loader2 className='h-5 w-5 animate-spin text-muted-foreground' />
         </div>
       ) : manifests.length === 0 ? (
-        <div className='py-8 text-center text-sm text-muted-foreground'>
+        <div className='py-8 text-center text-xs text-muted-foreground'>
           {t('backup.manifestsEmpty')}
         </div>
       ) : (
@@ -325,7 +403,7 @@ export default function ManifestBrowser({ stacked = false }: ManifestBrowserProp
               {manifests.map((m) => (
                 <div
                   key={m.id}
-                  className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm ${
+                  className={`flex w-full items-center gap-2 px-3 py-2 text-left text-xs ${
                     m.id === selectedId ? 'bg-accent' : ''
                   }`}
                 >
@@ -369,7 +447,7 @@ export default function ManifestBrowser({ stacked = false }: ManifestBrowserProp
             }`}
           >
             <div className='flex items-center justify-between border-b px-3 py-2'>
-              <span className='min-w-0 flex-1 truncate text-sm text-muted-foreground'>
+              <span className='min-w-0 flex-1 truncate text-xs text-muted-foreground'>
                 {detail
                   ? `${detail.id} · ${detail.trigger}`
                   : t(
@@ -401,7 +479,7 @@ export default function ManifestBrowser({ stacked = false }: ManifestBrowserProp
                 </div>
               )}
               {!detail ? (
-                <div className='flex h-full items-center justify-center px-4 text-center text-sm text-muted-foreground'>
+                <div className='flex h-full items-center justify-center px-4 text-center text-xs text-muted-foreground'>
                   {t('backup.manifestHint')}
                 </div>
               ) : (
@@ -579,7 +657,7 @@ export default function ManifestBrowser({ stacked = false }: ManifestBrowserProp
             <AlertDialogDescription>
               {t(
                 'backup.deleteConfirmBody',
-                'Restore point {{id}} ({{created}} · {{bytes}}) will be permanently deleted. Objects shared with other restore points are kept; the rest are removed from the bucket. This cannot be undone.',
+                'Restore point {{id}} ({{created}} · {{bytes}}) will be permanently deleted. Objects shared with other restore points are kept; the rest are removed from the target. This cannot be undone.',
                 {
                   id: deleteTarget?.id,
                   created: deleteTarget ? formatTime(deleteTarget.created) : '',

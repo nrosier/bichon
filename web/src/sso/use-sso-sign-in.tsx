@@ -21,6 +21,7 @@ import { AxiosError } from 'axios'
 import { useLocation, useNavigate } from '@tanstack/react-router'
 import { useTranslation } from 'react-i18next'
 import { setToken } from '@/stores/authStore'
+import { isTheme } from '@/lib/theme'
 import { toSearchParams } from '@/lib/utils'
 import { toast } from '@/hooks/use-toast'
 import { ToastAction } from '@/components/ui/toast'
@@ -99,7 +100,7 @@ export function useSsoSignIn(redirect: string): SsoSignIn {
   const applyLogin = (result: OidcHandoffResult, target: string) => {
     setToken(result)
 
-    if (result.theme) {
+    if (isTheme(result.theme)) {
       setTheme(result.theme)
     }
 
@@ -131,21 +132,13 @@ export function useSsoSignIn(redirect: string): SsoSignIn {
   const redeemed = useRef(false)
   const startedRedirect = useRef(false)
 
+  // The message itself is shown by the sign-in form's shared error effect, which
+  // maps the code to text. This only drops the code from the URL so a refresh
+  // does not replay it.
   useEffect(() => {
     if (!oidcError || notifiedError.current) return
     notifiedError.current = true
 
-    toast({
-      variant: 'destructive',
-      title: t('auth.ssoFailed', 'Single sign-on failed'),
-      description: oidcError,
-      action: (
-        <ToastAction altText={t('common.tryAgain')}>
-          {t('common.tryAgain')}
-        </ToastAction>
-      ),
-    })
-    // Drop the message from the URL so a refresh does not replay it.
     backToForm()
   }, [oidcError])
 

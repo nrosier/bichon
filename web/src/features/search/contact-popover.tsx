@@ -127,7 +127,12 @@ function ContactSelectorField({
 }) {
     const { t } = useTranslation()
     const [searchTerm, setSearchTerm] = React.useState("")
-    const { contacts, isLoading } = useContacts(searchTerm)
+    const { contacts, isLoading, isError } = useContacts(searchTerm)
+    // The archive only knows display names for senders; fall back to the bare
+    // address when the chosen contact has none.
+    const selectedName = value
+        ? contacts.find((contact) => contact.email === value)?.name
+        : undefined
 
     const handleToggle = (email: string) => {
         if (value === email) {
@@ -148,10 +153,11 @@ function ContactSelectorField({
                     )}
                 >
                     <div className="flex flex-col items-start pr-6">
-                        <span className="text-[10px] font-bold uppercase opacity-50 tracking-tight leading-none">
+                        <span className="text-xs font-bold uppercase opacity-50 tracking-tight leading-none">
                             {label}
                         </span>
                         <span
+                            title={value}
                             className={cn(
                                 "mt-0.5 truncate max-w-[320px]",
                                 value
@@ -159,7 +165,11 @@ function ContactSelectorField({
                                     : "text-xs text-muted-foreground/90"
                             )}
                         >
-                            {value || t('search_contacts.any')}
+                            {value
+                                ? selectedName
+                                    ? `${selectedName} <${value}>`
+                                    : value
+                                : t('search_contacts.any')}
                         </span>
                     </div>
 
@@ -200,29 +210,36 @@ function ContactSelectorField({
                         {isLoading && (
                             <div className="p-4 text-xs text-center opacity-50">{t('search_contacts.loading')}</div>
                         )}
-                        <CommandEmpty>{t('search_contacts.no_contact_found')}</CommandEmpty>
+                        {isError && (
+                            <div className="p-4 text-xs text-center text-destructive">
+                                {t('address_select.loadFailed', 'Could not load contacts.')}
+                            </div>
+                        )}
+                        {!isError && (
+                            <CommandEmpty>{t('search_contacts.no_contact_found')}</CommandEmpty>
+                        )}
                         <CommandGroup>
-                            {contacts.slice(0, 100).map((email) => (
+                            {contacts.slice(0, 100).map((contact) => (
                                 <CommandItem
-                                    key={email}
-                                    onSelect={() => handleToggle(email)}
+                                    key={contact.email}
+                                    onSelect={() => handleToggle(contact.email)}
                                     className="flex items-center justify-between py-2.5 px-3 cursor-pointer whitespace-nowrap gap-4 text-xs"
                                 >
                                     <div className="flex flex-col min-w-0">
                                         <span className="font-medium">
-                                            {email.split('@')[0]}
+                                            {contact.name || contact.email.split('@')[0]}
                                         </span>
-                                        <span className="text-[10px] text-muted-foreground truncate max-w-[360px]">
-                                            {email}
+                                        <span className="text-xs text-muted-foreground truncate max-w-[360px]">
+                                            {contact.email}
                                         </span>
                                     </div>
-                                    {value === email && (
+                                    {value === contact.email && (
                                         <Check className="h-4 w-4 text-primary shrink-0" />
                                     )}
                                 </CommandItem>
                             ))}
                             {contacts.length > 100 && (
-                                <div className="px-3 py-2 text-[10px] text-center text-muted-foreground border-t border-border/50">
+                                <div className="px-3 py-2 text-xs text-center text-muted-foreground border-t border-border/50">
                                     {t('search_contacts.showing_limit', { total: contacts.length })}
                                 </div>
                             )}

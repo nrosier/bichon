@@ -61,10 +61,31 @@ pub async fn delete_mailbox_impl(account_id: u64, mailbox_id: u64) -> BichonResu
         ));
     }
 
+    // Minimum retention: a mailbox deletion cascades to its messages, so the
+    // same protection as a message delete applies. Clear the lock first.
+    if account.min_retention_days_effective() > 0 {
+        return Err(raise_error!(
+            format!(
+                "Account {} ({}) has a {}-day minimum retention lock; clear it before deleting mailboxes",
+                account.id,
+                account.email,
+                account.min_retention_days_effective()
+            ),
+            ErrorCode::Forbidden
+        ));
+    }
+
     let ids_to_delete = mailbox_subtree_ids(account_id, mailbox_id)?;
 
     if ids_to_delete.is_empty() {
         return Ok(());
+    }
+
+    // Drop the source-UID tombstones together with the mailbox. Leaving them
+    // behind would keep suppressing re-downloads if a mailbox id were reused
+    // and would leak one file per deleted mailbox.
+    for id in &ids_to_delete {
+        crate::archive::imap::tombstones::remove_mailbox(account_id, *id).await?;
     }
 
     for id in &ids_to_delete {
@@ -96,11 +117,7 @@ mod tests {
     static TEST_ENV: Once = Once::new();
     fn init_test_env() {
         TEST_ENV.call_once(|| {
-            let root = std::env::temp_dir().join(format!(
-                "bichon-core-test-{}",
-                std::process::id()
-            ));
-            std::fs::create_dir_all(&root).unwrap();
+            let root = crate::test_support::unique_test_root("bichon-core-test");
             std::env::set_var("BICHON_ROOT_DIR", &root);
             std::env::set_var("BICHON_ENCRYPT_PASSWORD", "test-password");
             let _ = &*SETTINGS;
@@ -130,7 +147,12 @@ mod tests {
             download_schedule: None,
             archive_rules: None,
             extraction_rules: None,
+            override_from_headers: None,
             retention_days: None,
+            min_retention_days: None,
+            remote_cleanup: None,
+            kind: None,
+            view: None,
         };
         let account = AccountModel::new(id, request).unwrap();
         insert_impl(DB_MANAGER.db(), account.clone()).unwrap();

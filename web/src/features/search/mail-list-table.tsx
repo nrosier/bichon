@@ -17,7 +17,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 
-import { dateFnsLocaleMap, formatBytes } from "@/lib/utils"
+import { cn, dateFnsLocaleMap, formatBytes, formatSender } from "@/lib/utils"
 import { format, formatDistanceToNow } from "date-fns"
 import { MessageSquareText, Paperclip } from "lucide-react"
 import { Skeleton } from "@/components/ui/skeleton"
@@ -36,9 +36,15 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import { DataTableToolbar } from "./table/toolbar"
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card"
 import { useSearchMessages } from "@/hooks/use-search-messages"
+import { nextSelectAllAction } from './select-all'
+import useMinimalAccountList from "@/hooks/use-minimal-account-list"
 
 interface MailListProps {
   items: EmailEnvelope[]
+  /// Total matching messages across all pages (not just the page in `items`).
+  /// Needed to decide whether a second click on the header checkbox can mean
+  /// "all matching results".
+  total: number
   isLoading: boolean
   onEnvelopeChanged: (envelope: EmailEnvelope) => void
   setSortBy: (sortBy: "DATE" | "SIZE" | "RELEVANCE") => void
@@ -47,6 +53,7 @@ interface MailListProps {
 
 export function MailListTable({
   items,
+  total,
   isLoading,
   onEnvelopeChanged,
   setSortBy,
@@ -55,7 +62,70 @@ export function MailListTable({
   const { t, i18n } = useTranslation()
 
   const locale = dateFnsLocaleMap[i18n.language.toLowerCase()] ?? enUS
-  const { selected, setSelected, dateDisplay } = useSearchContext()
+  const {
+    selected,
+    setSelected,
+    selectAllScope,
+    setSelectAllScope,
+    dateDisplay,
+  } = useSearchContext()
+  const { minimalList = [] } = useMinimalAccountList()
+
+  // Which accounts this user may name in a filter. A view is not one of them:
+  // the `account_id` on a result row is the *source* account (the row is the
+  // source's message), and a viewer holds no grant on it — the server drops an
+  // account the caller cannot read, so clicking through would empty the list
+  // instead of narrowing it. Only accounts the account picker offers are
+  // clickable.
+  const filterableAccounts = new Set(minimalList.map((account) => account.id))
+
+  const totalSelected = Array.from(selected.values()).reduce(
+    (sum, set) => sum + set.size,
+    0
+  )
+  const hasSelected = (accountId: number, mailId: string) =>
+    selected.get(accountId)?.has(mailId) ?? false
+  const pageAllSelected =
+    items.length > 0 &&
+    items.every((item) => selected.get(item.account_id)?.has(item.id))
+
+  /// The header checkbox acts on the page only. Widening to "every matching
+  /// result" is the banner's job, where the action and its count are visible
+  /// before it is clicked.
+  const handleToggleAll = () => {
+    switch (
+      nextSelectAllAction({
+        scopeActive: !!selectAllScope,
+        pageAllSelected,
+      })
+    ) {
+      case 'clear':
+        setSelectAllScope(null)
+        setSelected(new Map())
+        return
+      case 'deselect-page':
+        setSelected((prev) => {
+          const next = new Map(prev)
+          for (const item of items) {
+            const set = next.get(item.account_id)
+            set?.delete(item.id)
+            if (set && set.size === 0) next.delete(item.account_id)
+          }
+          return next
+        })
+        return
+      case 'select-page':
+        setSelected((prev) => {
+          const next = new Map(prev)
+          for (const item of items) {
+            const set = new Set(next.get(item.account_id) || [])
+            set.add(item.id)
+            next.set(item.account_id, set)
+          }
+          return next
+        })
+    }
+  }
 
   const columns: ColumnDef<EmailEnvelope>[] = [
     {
@@ -63,7 +133,7 @@ export function MailListTable({
       header: () => (
         <Checkbox
           checked={
-            totalSelected === items.length && items.length > 0
+            selectAllScope || pageAllSelected
               ? true
               : totalSelected > 0
                 ? "indeterminate"
@@ -71,6 +141,11 @@ export function MailListTable({
           }
           onCheckedChange={handleToggleAll}
           className="h-4 w-4"
+          title={
+            selectAllScope
+              ? t('search.batchDelete.clearScope', 'Clear the selection')
+              : undefined
+          }
         />
       ),
       cell: ({ row }) => (
@@ -89,43 +164,54 @@ export function MailListTable({
       accessorKey: "source",
       header: t('search.source'),
       cell: ({ row }) => {
-        const { from, account_email, account_name, mailbox_name, account_id, mailbox_id } = row.original;
+        const { from, from_name, wire_from, account_email, account_name, mailbox_name, account_id, mailbox_id } = row.original;
         const { setFilter } = useSearchMessages();
         const accountPrefix = account_name || account_email.split('@')[0];//https://github.com/rustmailer/bichon/issues/306
+        // A view's rows name the source account, which the viewer cannot filter
+        // by — see `filterableAccounts`. The labels still show it (that is
+        // where the message came from), they just stop being links.
+        const canFilterAccount = filterableAccounts.has(account_id);
 
         return (
           <div className="flex flex-col py-0.5 min-w-0 group">
             <div
               className="cursor-pointer hover:text-primary transition-colors flex items-center gap-1.5"
+              title={wire_from ? `via ${wire_from}` : undefined}
               onClick={(e) => {
                 e.stopPropagation();
                 setFilter((prev: any) => ({ ...prev, from: from }));
               }}
             >
               <LongText className="text-xs truncate">
-                {from}
+                {formatSender(from_name, from)}
               </LongText>
             </div>
 
             <div className="flex items-center gap-1 mt-1 text-[10px] text-muted-foreground/70">
               <span
-                className="truncate max-w-[90px] hover:text-primary cursor-pointer transition-colors"
+                className={cn(
+                  "truncate max-w-[90px] transition-colors",
+                  canFilterAccount && "hover:text-primary cursor-pointer"
+                )}
                 title={account_email}
-                onClick={(e) => {
+                onClick={canFilterAccount ? (e) => {
                   e.stopPropagation();
                   setFilter((prev: any) => ({ ...prev, account_ids: [account_id], mailbox_ids: undefined }));
-                }}
+                } : undefined}
               >
                 {accountPrefix}
               </span>
 
               <span className="shrink-0 opacity-40">/</span>
               <span
-                className="truncate max-w-[70px] hover:text-primary cursor-pointer transition-colors"
-                onClick={(e) => {
+                className={cn(
+                  "truncate max-w-[70px] transition-colors",
+                  canFilterAccount && "hover:text-primary cursor-pointer"
+                )}
+                onClick={canFilterAccount ? (e) => {
                   e.stopPropagation();
                   setFilter((prev: any) => ({ ...prev, account_ids: [account_id], mailbox_ids: [mailbox_id] }));
-                }}
+                } : undefined}
               >
                 {mailbox_name}
               </span>
@@ -319,25 +405,15 @@ export function MailListTable({
     },
   ]
 
-  const handleToggleAll = () => {
-    const total = Array.from(selected.values()).reduce((sum, set) => sum + set.size, 0)
-
-    if (total === items.length && items.length > 0) {
-      setSelected(new Map())
-    } else {
-      setSelected(prev => {
-        const next = new Map(prev)
-        for (const item of items) {
-          const set = new Set(next.get(item.account_id) || [])
-          set.add(item.id)
-          next.set(item.account_id, set)
-        }
-        return next
-      })
-    }
-  }
-
   const toggleSelected = (accountId: number, mailId: string) => {
+    // A row click while "all matching" is active is a deliberate narrowing:
+    // drop the scope and start an explicit selection instead of silently
+    // mixing the two models.
+    if (selectAllScope) {
+      setSelectAllScope(null)
+      setSelected(new Map([[accountId, new Set([mailId])]]))
+      return
+    }
     setSelected(prev => {
       const next = new Map(prev)
       const set = new Set(next.get(accountId) || [])
@@ -354,13 +430,9 @@ export function MailListTable({
     })
   }
 
-  const totalSelected = Array.from(selected.values()).reduce((sum, set) => sum + set.size, 0)
-
-  const hasSelected = (accountId: number, mailId: string) => selected.get(accountId)?.has(mailId) ?? false
-
   if (isLoading) {
     return (
-      <div className="divide-y divide-border">
+      <div className="divide-y divide-border max-h-[calc(100vh-18rem)] overflow-hidden">
         {Array.from({ length: 30 }).map((_, i) => (
           <div key={i} className="flex items-center gap-2 px-2 py-1.5">
             <Skeleton className="h-3 w-3" />
@@ -391,7 +463,15 @@ export function MailListTable({
         }}
 
       </SearchTable>
-      {totalSelected > 0 && <MailBulkActions />}
+      {(totalSelected > 0 || selectAllScope) && (
+        <MailBulkActions
+          selectAllMatchingCount={
+            !selectAllScope && pageAllSelected && total > items.length
+              ? total
+              : undefined
+          }
+        />
+      )}
     </>
   )
 }

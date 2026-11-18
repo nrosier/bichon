@@ -60,8 +60,18 @@ pub struct AccountResp {
     pub archive_rules: Option<ArchiveRules>,
     /// Attachment text extraction rules (Pro feature); `None` = extract everything.
     pub extraction_rules: Option<ExtractionRules>,
+    /// Header names whose first valid mailbox replaces the stored sender.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_from_headers: Option<Vec<String>>,
     /// Account-level retention window in days (free/community). `None`/`0` = keep everything.
     pub retention_days: Option<u64>,
+    /// Minimum retention in days (Enterprise). Messages inside the window
+    /// cannot be deleted. `None`/`0` = no lock.
+    #[serde(default)]
+    pub min_retention_days: Option<u64>,
+    /// Source-mailbox cleanup configuration (community); `None` = not configured.
+    #[serde(default)]
+    pub remote_cleanup: Option<crate::account::migration::RemoteCleanupConfig>,
     /// Legal hold flag (Enterprise); while set the retention sweep and bulk deletion skip this account.
     #[serde(default)]
     pub legal_hold: bool,
@@ -72,6 +82,12 @@ pub struct AccountResp {
     /// Epoch millis when the hold was placed.
     pub hold_placed_at: Option<i64>,
     pub deleting: bool,
+    /// Optional special role (journal); `None` = ordinary account or view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<crate::account::migration::AccountKind>,
+    /// Sources and filters of a `View` account; `None` for every other type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<crate::account::migration::ViewConfig>,
 }
 
 impl AccountResp {
@@ -110,12 +126,17 @@ impl AccountResp {
             download_schedule: account.download_schedule,
             archive_rules: account.archive_rules,
             extraction_rules: account.extraction_rules,
+            override_from_headers: account.override_from_headers,
             retention_days: account.retention_days,
+            min_retention_days: account.min_retention_days,
+            remote_cleanup: account.remote_cleanup,
             legal_hold: account.legal_hold,
             hold_reason: account.hold_reason,
             hold_placed_by: account.hold_placed_by,
             hold_placed_at: account.hold_placed_at,
             deleting: account.deleting,
+            kind: account.kind,
+            view: account.view,
         }
     }
 }

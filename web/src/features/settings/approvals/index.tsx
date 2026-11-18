@@ -83,6 +83,18 @@ const OP_LABELS: Record<string, { key: string; fallback: string }> = {
     key: 'settings.approvals.opTokenRevoke',
     fallback: 'Revoke an API token',
   },
+  'export.batch': {
+    key: 'settings.approvals.opExportBatch',
+    fallback: 'Export a batch of archived mail',
+  },
+  'gdpr.erasure': {
+    key: 'settings.approvals.opGdprErasure',
+    fallback: 'Execute a GDPR erasure request',
+  },
+  'retention.update': {
+    key: 'settings.approvals.opRetentionUpdate',
+    fallback: 'Weaken a retention policy',
+  },
 }
 
 /** The operations that delete data, as opposed to releasing protection. Shown
@@ -93,6 +105,9 @@ const DESTRUCTIVE_OPS = new Set([
   'account.delete',
   'mailbox.delete',
   'message.delete',
+  // Not an immediate deletion, but it is the one way to shorten the window
+  // that protects data, so it belongs on the warning path.
+  'retention.update',
 ])
 
 /** Operations whose blast radius is not obvious from the label.
@@ -103,11 +118,21 @@ const DESTRUCTIVE_OPS = new Set([
  *  letting an administrator discover it from a broken pipeline. */
 const REVOCATION_OPS = new Set(['token.revoke'])
 
+/** Operations whose *absence* from the policy is the consequential choice.
+ *
+ *  Every other op behaves as it always did when it is not listed. A GDPR
+ *  erasure does not: the request is recorded and then executed on the
+ *  submitter's signature alone, which is the opposite of what the workflow
+ *  exists for. Saying so here is the only place an administrator can learn it
+ *  — the erasure form itself warns the operator, but nobody sees that until
+ *  they are already erasing. */
+const ERASURE_OPS = new Set(['gdpr.erasure'])
+
 export function ApprovalSettings() {
   const { t } = useTranslation()
   const { toast } = useToast()
   const { isEnterprise } = useEdition()
-  const { require_any_permission } = useCurrentUser()
+  const { canGlobal } = useCurrentUser()
 
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -124,7 +149,7 @@ export function ApprovalSettings() {
   const [breakGlassHours, setBreakGlassHours] = useState('1')
 
   const canManage =
-    isEnterprise && require_any_permission(['system:root', 'user:manage'])
+    isEnterprise && (canGlobal('system:root') || canGlobal('user:manage'))
 
   useEffect(() => {
     if (!canManage) return
@@ -303,6 +328,14 @@ export function ApprovalSettings() {
                         {t(
                           'settings.approvals.revocationHint',
                           'Gating this means a token cannot be revoked until a second person approves — including a user revoking their own leaked token.'
+                        )}
+                      </p>
+                    )}
+                    {ERASURE_OPS.has(op) && !ops.includes(op) && (
+                      <p className='text-xs text-amber-600 dark:text-amber-400'>
+                        {t(
+                          'settings.approvals.erasureHint',
+                          'Not listed: an erasure request is still recorded, but it runs on the submitter’s signature alone — nobody else signs it.'
                         )}
                       </p>
                     )}

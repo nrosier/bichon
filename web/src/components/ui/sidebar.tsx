@@ -22,33 +22,18 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+import {
+  SidebarContext,
+  useOptionalSidebar,
+  useSidebar,
+  type SidebarContextValue,
+} from '@/components/ui/sidebar-context'
 
 const SIDEBAR_COOKIE_NAME = 'sidebar_state'
 const SIDEBAR_WIDTH = '14rem'
 const SIDEBAR_WIDTH_MOBILE = '16rem'
 const SIDEBAR_WIDTH_ICON = '3rem'
 const SIDEBAR_KEYBOARD_SHORTCUT = 'b'
-
-type SidebarContext = {
-  state: 'expanded' | 'collapsed'
-  open: boolean
-  setOpen: (open: boolean) => void
-  openMobile: boolean
-  setOpenMobile: (open: boolean) => void
-  isMobile: boolean
-  toggleSidebar: () => void
-}
-
-const SidebarContext = React.createContext<SidebarContext | null>(null)
-
-function useSidebar() {
-  const context = React.useContext(SidebarContext)
-  if (!context) {
-    throw new Error('useSidebar must be used within a SidebarProvider.')
-  }
-
-  return context
-}
 
 const SidebarProvider = React.forwardRef<
   HTMLDivElement,
@@ -118,7 +103,7 @@ const SidebarProvider = React.forwardRef<
     // This makes it easier to style the sidebar with Tailwind classes.
     const state = open ? 'expanded' : 'collapsed'
 
-    const contextValue = React.useMemo<SidebarContext>(
+    const contextValue = React.useMemo<SidebarContextValue>(
       () => ({
         state,
         open,
@@ -271,7 +256,10 @@ const SidebarTrigger = React.forwardRef<
   React.ElementRef<typeof Button>,
   React.ComponentProps<typeof Button>
 >(({ className, onClick, ...props }, ref) => {
-  const { toggleSidebar } = useSidebar()
+  // Optional rather than strict: the header trigger is mounted on every
+  // authenticated page, and if it ever renders without a provider we want a
+  // dead button, not a crashed route.
+  const sidebar = useOptionalSidebar()
 
   return (
     <Button
@@ -282,7 +270,7 @@ const SidebarTrigger = React.forwardRef<
       className={cn('h-7 w-7', className)}
       onClick={(event) => {
         onClick?.(event)
-        toggleSidebar()
+        sidebar?.toggleSidebar()
       }}
       {...props}
     >
@@ -418,7 +406,7 @@ const SidebarContent = React.forwardRef<
       {...props}
     >
       <ScrollArea className='min-h-0 w-full flex-1'>
-        <div className='flex flex-col gap-2'>{children}</div>
+        <div className='flex flex-col gap-1'>{children}</div>
       </ScrollArea>
     </div>
   )
@@ -433,7 +421,7 @@ const SidebarGroup = React.forwardRef<
     <div
       ref={ref}
       data-sidebar='group'
-      className={cn('relative flex w-full min-w-0 flex-col p-2', className)}
+      className={cn('relative flex w-full min-w-0 flex-col px-2 py-1', className)}
       {...props}
     />
   )

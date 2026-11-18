@@ -61,6 +61,7 @@ fn config(link_by_email: bool) -> OidcConfig {
         default_role_id: DEFAULT_MEMBER_ROLE_ID,
         auto_redirect: false,
         link_by_email,
+        allowed_email_domains: vec![],
     }
 }
 
@@ -293,4 +294,414 @@ async fn an_unknown_handoff_id_is_rejected() {
     let body: HandoffBody = resp.json().await.value().deserialize();
     assert!(!body.success);
     assert!(body.access_token.is_none());
+}
+
+// ── SSO admin API, status, features and code-only callbacks ─────────────────
+//
+// These go through the real routes. The SSO settings are one process-wide
+// document in the shared test database, so every test that reads or writes them
+// holds `sso_lock()` and starts from `reset_sso()`. None of them makes an
+// outbound request: building an active config does no I/O, and every branch
+// asserted below returns before the provider would be contacted.
+
+use poem::http::StatusCode;
+use poem::test::{TestClient, TestResponse};
+use poem::Endpoint;
+use serde_json::{json, Value};
+use tokio::sync::{Mutex as AsyncMutex, MutexGuard};
+
+use crate::rest::oidc::attach;
+use crate::rest::public::features::get_features;
+use crate::tests::admin_token;
+
+/// A value that appears nowhere else, so finding it in a body means a leak.
+const SECRET: &str = "s3cr3t-test-value";
+
+static SSO_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
+
+async fn sso_lock() -> MutexGuard<'static, ()> {
+    SSO_LOCK.lock().await
+}
+
+/// The routes under test. `attach` puts `ApiGuard` on the admin routes itself,
+/// exactly as in production; the public ones stay open.
+fn sso_route() -> impl Endpoint {
+    attach(poem::Route::new().nest("/api/v1/features", poem::get(get_features)))
+}
+
+fn client() -> TestClient<impl Endpoint> {
+    TestClient::new(sso_route()).default_header("X-Forwarded-For", "127.0.0.1")
+}
+
+fn bearer(token: &str) -> String {
+    format!("Bearer {token}")
+}
+
+async fn body_text(resp: TestResponse) -> (StatusCode, String) {
+    let status = resp.0.status();
+    let text = resp
+        .0
+        .into_body()
+        .into_string()
+        .await
+        .expect("the body should be text");
+    (status, text)
+}
+
+async fn put_sso(cli: &TestClient<impl Endpoint>, token: &str, body: Value) -> (StatusCode, String) {
+    body_text(
+        cli.put("/api/v1/sso")
+            .header("Authorization", bearer(token))
+            .body_json(&body)
+            .send()
+            .await,
+    )
+    .await
+}
+
+async fn get_sso(cli: &TestClient<impl Endpoint>, token: &str) -> (StatusCode, String) {
+    body_text(
+        cli.get("/api/v1/sso")
+            .header("Authorization", bearer(token))
+            .send()
+            .await,
+    )
+    .await
+}
+
+fn json_of(text: &str) -> Value {
+    serde_json::from_str(text).unwrap_or_else(|e| panic!("not JSON ({e}): {text}"))
+}
+
+/// Back to "SSO off, nothing configured, no secret".
+async fn reset_sso(cli: &TestClient<impl Endpoint>, token: &str) {
+    let (status, text) = put_sso(
+        cli,
+        token,
+        json!({
+            "enabled": false,
+            "issuer_url": null,
+            "client_id": null,
+            "redirect_uri": null,
+            "client_secret": "",
+            "allowed_email_domains": null,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "reset failed: {text}");
+}
+
+/// A config that `OidcConfig::load()` accepts, with no I/O to get there.
+fn active_body() -> Value {
+    json!({
+        "enabled": true,
+        "issuer_url": "https://idp.example.com",
+        "client_id": "bichon",
+        "redirect_uri": "https://mail.example.com/api/auth/oidc/callback",
+    })
+}
+
+fn location(resp: &TestResponse) -> String {
+    resp.0
+        .headers()
+        .get("location")
+        .expect("a redirect carries a Location")
+        .to_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[tokio::test]
+async fn sso_config_round_trip_reports_the_secret_as_set_without_returning_it() {
+    setup().await;
+    let _guard = sso_lock().await;
+    let token = admin_token().await;
+    let cli = client();
+    reset_sso(&cli, &token).await;
+
+    let mut body = active_body();
+    body["client_secret"] = json!(SECRET);
+    body["allowed_email_domains"] = json!(["example.com"]);
+    let (status, put_text) = put_sso(&cli, &token, body).await;
+    assert_eq!(status, StatusCode::OK, "{put_text}");
+    assert!(!put_text.contains(SECRET), "PUT response leaked the secret");
+
+    let (status, get_text) = get_sso(&cli, &token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!get_text.contains(SECRET), "GET response leaked the secret");
+    let view = json_of(&get_text);
+    assert_eq!(view["client_secret_set"], json!(true));
+    assert_eq!(view["issuer_url"], json!("https://idp.example.com"));
+    assert_eq!(view["enabled"], json!(true));
+    assert_eq!(view["allowed_email_domains"], json!(["example.com"]));
+
+    reset_sso(&cli, &token).await;
+}
+
+#[tokio::test]
+async fn sso_client_secret_is_kept_masked_cleared_or_replaced_as_asked() {
+    setup().await;
+    let _guard = sso_lock().await;
+    let token = admin_token().await;
+    let cli = client();
+    reset_sso(&cli, &token).await;
+
+    let (status, text) = put_sso(&cli, &token, json!({ "client_secret": SECRET })).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(json_of(&text)["client_secret_set"], json!(true));
+
+    // (what is sent, whether a secret is stored afterwards)
+    let steps: [(Value, bool, &str); 4] = [
+        (json!({ "client_id": "bichon" }), true, "absent keeps"),
+        (json!({ "client_secret": "********" }), true, "the mask keeps"),
+        (json!({ "client_secret": "" }), false, "empty clears"),
+        (json!({ "client_secret": "new" }), true, "a value sets"),
+    ];
+    for (body, expect_set, why) in steps {
+        let (status, text) = put_sso(&cli, &token, body).await;
+        assert_eq!(status, StatusCode::OK, "{why}: {text}");
+        assert!(!text.contains(SECRET), "{why}: PUT leaked the secret");
+        assert!(!text.contains("\"new\""), "{why}: PUT leaked the new secret");
+        assert_eq!(json_of(&text)["client_secret_set"], json!(expect_set), "{why} (PUT)");
+
+        let (status, text) = get_sso(&cli, &token).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!text.contains(SECRET), "{why}: GET leaked the secret");
+        assert_eq!(json_of(&text)["client_secret_set"], json!(expect_set), "{why} (GET)");
+    }
+
+    reset_sso(&cli, &token).await;
+}
+
+#[tokio::test]
+async fn sso_admin_routes_reject_a_missing_token_with_401() {
+    setup().await;
+    let cli = client();
+
+    let resp = cli.get("/api/v1/sso").send().await;
+    assert_eq!(resp.0.status(), StatusCode::UNAUTHORIZED, "GET /sso");
+
+    let resp = cli.put("/api/v1/sso").body_json(&json!({})).send().await;
+    assert_eq!(resp.0.status(), StatusCode::UNAUTHORIZED, "PUT /sso");
+
+    let resp = cli
+        .post("/api/v1/sso/test")
+        .body_json(&json!({ "issuer_url": "not a url" }))
+        .send()
+        .await;
+    assert_eq!(resp.0.status(), StatusCode::UNAUTHORIZED, "POST /sso/test");
+}
+
+#[tokio::test]
+async fn sso_admin_routes_reject_a_user_without_user_manage_or_root_with_403() {
+    setup().await;
+    let _guard = sso_lock().await;
+    let admin = admin_token().await;
+    let cli = client();
+
+    // A regular member: the default role carries `system:access` only.
+    let username = "sso-plain-member";
+    let password = "member-pass-123";
+    let api = crate::tests::build_api_route();
+    let api = TestClient::new(api).default_header("X-Forwarded-For", "127.0.0.1");
+    let resp = api
+        .post("/api/v1/users")
+        .header("Authorization", bearer(&admin))
+        .body_json(&json!({
+            "username": username,
+            "email": "sso-plain-member@example.com",
+            "password": password,
+            "global_roles": [DEFAULT_MEMBER_ROLE_ID],
+            "account_access_map": {},
+        }))
+        .send()
+        .await;
+    resp.assert_status_is_ok();
+
+    let login = TestClient::new(
+        poem::Route::new().at("/api/login", poem::post(crate::rest::public::login::login)),
+    );
+    let resp = login
+        .post("/api/login")
+        .body_json(&json!({ "username": username, "password": password }))
+        .send()
+        .await;
+    resp.assert_status_is_ok();
+    let login_body: Value = resp.json().await.value().deserialize();
+    let member = login_body["access_token"]
+        .as_str()
+        .expect("the member should be able to log in")
+        .to_owned();
+
+    let (status, text) = get_sso(&cli, &member).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "GET: {text}");
+
+    let (status, text) = put_sso(&cli, &member, json!({ "enabled": false })).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "PUT: {text}");
+}
+
+#[tokio::test]
+async fn sso_update_names_the_field_it_rejects_with_400() {
+    setup().await;
+    let _guard = sso_lock().await;
+    let token = admin_token().await;
+    let cli = client();
+    reset_sso(&cli, &token).await;
+
+    let (status, text) = put_sso(&cli, &token, json!({ "enabled": true })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    let field = json_of(&text)["field"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        field == "issuer_url" || field == "enabled",
+        "expected issuer_url or enabled, got {field:?}: {text}"
+    );
+
+    let (status, text) = put_sso(
+        &cli,
+        &token,
+        json!({ "allowed_email_domains": ["-x.com"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    assert_eq!(json_of(&text)["field"], json!("allowed_email_domains"), "{text}");
+
+    // A rejected update must leave nothing half-applied.
+    let (_, text) = get_sso(&cli, &token).await;
+    let view = json_of(&text);
+    assert_eq!(view["enabled"], json!(false));
+    assert_eq!(view["allowed_email_domains"], json!([]));
+
+    reset_sso(&cli, &token).await;
+}
+
+#[tokio::test]
+async fn sso_test_endpoint_rejects_an_unparseable_issuer_without_contacting_anything() {
+    setup().await;
+    let token = admin_token().await;
+    let cli = client();
+
+    let (status, text) = body_text(
+        cli.post("/api/v1/sso/test")
+            .header("Authorization", bearer(&token))
+            .body_json(&json!({ "issuer_url": "not a url" }))
+            .send()
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let result = json_of(&text);
+    assert_eq!(result["ok"], json!(false), "{text}");
+    assert_eq!(result["kind"], json!("invalid_issuer"), "{text}");
+}
+
+#[tokio::test]
+async fn oidc_status_with_sso_off_is_unavailable_and_needs_no_token() {
+    setup().await;
+    let _guard = sso_lock().await;
+    let token = admin_token().await;
+    let cli = client();
+    reset_sso(&cli, &token).await;
+
+    let (status, text) = body_text(cli.get("/api/auth/oidc/status").send().await).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let st = json_of(&text);
+    assert_eq!(st["available"], json!(false), "{text}");
+    assert_eq!(st["configured"], json!(false), "{text}");
+    assert!(st.get("code").is_some_and(Value::is_null), "code must be null: {text}");
+    assert!(st["checked_at"].is_i64(), "checked_at must be a number: {text}");
+}
+
+#[tokio::test]
+async fn features_reports_community_edition_and_sso_support() {
+    setup().await;
+    let _guard = sso_lock().await;
+    let cli = client();
+
+    let (status, text) = body_text(cli.get("/api/v1/features").send().await).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let f = json_of(&text);
+    assert!(f["sso_enabled"].is_boolean(), "{text}");
+    assert_eq!(f["sso_supported"], json!(true), "{text}");
+    assert_eq!(f["edition"], json!("community"), "{text}");
+    assert!(f["features"].is_array(), "{text}");
+    assert!(f["version"].is_string(), "{text}");
+}
+
+#[tokio::test]
+async fn logout_with_sso_off_is_a_plain_local_sign_out_with_no_error() {
+    setup().await;
+    let _guard = sso_lock().await;
+    let token = admin_token().await;
+    let cli = client();
+    reset_sso(&cli, &token).await;
+
+    let resp = cli.get("/api/auth/oidc/logout").send().await;
+    assert_eq!(resp.0.status(), StatusCode::TEMPORARY_REDIRECT);
+    let loc = location(&resp);
+    assert_eq!(loc, "/sign-in?local=1");
+    assert!(!loc.contains("oidc_error"), "{loc}");
+}
+
+#[tokio::test]
+async fn callback_with_sso_off_redirects_with_a_bare_code() {
+    setup().await;
+    let _guard = sso_lock().await;
+    let token = admin_token().await;
+    let cli = client();
+    reset_sso(&cli, &token).await;
+
+    let resp = cli
+        .get("/api/auth/oidc/callback?error=access_denied&error_description=Please%20phish&state=x")
+        .send()
+        .await;
+    assert_eq!(resp.0.status(), StatusCode::TEMPORARY_REDIRECT);
+    let loc = location(&resp);
+    assert_eq!(loc, "/sign-in?oidc_error=sso_unavailable");
+    assert!(!loc.contains("oidc_error_code"), "{loc}");
+    assert!(!loc.contains(' ') && !loc.contains("%20") && !loc.contains("phish"), "{loc}");
+}
+
+#[tokio::test]
+async fn callback_reports_a_declined_sign_in_by_code_only() {
+    setup().await;
+    let _guard = sso_lock().await;
+    let token = admin_token().await;
+    let cli = client();
+    reset_sso(&cli, &token).await;
+    let (status, text) = put_sso(&cli, &token, active_body()).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+
+    let resp = cli
+        .get("/api/auth/oidc/callback?error=access_denied&error_description=Please%20phish&state=x")
+        .send()
+        .await;
+    assert_eq!(resp.0.status(), StatusCode::TEMPORARY_REDIRECT);
+    let loc = location(&resp);
+    assert_eq!(loc, "/sign-in?oidc_error=sso_declined");
+    assert!(!loc.contains("phish") && !loc.contains("access_denied"), "{loc}");
+
+    reset_sso(&cli, &token).await;
+}
+
+#[tokio::test]
+async fn callback_without_code_or_state_reports_an_incomplete_callback() {
+    setup().await;
+    let _guard = sso_lock().await;
+    let token = admin_token().await;
+    let cli = client();
+    reset_sso(&cli, &token).await;
+    let (status, text) = put_sso(&cli, &token, active_body()).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+
+    for path in [
+        "/api/auth/oidc/callback",
+        "/api/auth/oidc/callback?code=abc",
+        "/api/auth/oidc/callback?state=xyz",
+    ] {
+        let resp = cli.get(path).send().await;
+        assert_eq!(resp.0.status(), StatusCode::TEMPORARY_REDIRECT, "{path}");
+        assert_eq!(location(&resp), "/sign-in?oidc_error=sso_incomplete", "{path}");
+    }
+
+    reset_sso(&cli, &token).await;
 }

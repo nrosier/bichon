@@ -29,6 +29,9 @@ use std::net::IpAddr;
 use std::sync::{LazyLock, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use crate::account::access::ViewAccess;
+use crate::oauth2::entity::OAuth2ClientType;
+
 /// Free-form JSON value carried by events that need a content snapshot
 /// (e.g. the subject / attachment names of a message being deleted, so the
 /// audit trail stays self-describing after the content is gone).
@@ -45,6 +48,12 @@ pub enum Event {
         /// Subject of the viewed message, so the audit trail is readable
         /// without resolving the envelope again.
         subject: Option<String>,
+        /// Set when the message was readable through a *view* rather than a
+        /// direct grant. Without it the trail says "user U read a message in
+        /// account A" and cannot answer the compliance question behind it —
+        /// *by whose delegation*, and therefore whether the read was inside the
+        /// scope the viewer was meant to have.
+        via_view: Option<ViewAccess>,
     },
     EmailDeleted {
         email_id: String,
@@ -55,6 +64,12 @@ pub enum Event {
         subject: Option<String>,
         /// Snapshot of the deleted message (attachment names, from/to, ...).
         snapshot: Option<EventPayload>,
+        /// The job that performed the deletion, when it was a batch job.
+        job_id: Option<String>,
+        /// The search filter the job was created with. Recorded so the audit
+        /// trail answers "under which selection was this deleted", not only
+        /// "which messages disappeared".
+        filter: Option<crate::message::search::EmailSearchFilter>,
     },
     /// A large delete batch whose per-message detail was externalized to a
     /// detail file instead of N `email.deleted` records. The row carries the
@@ -76,6 +91,39 @@ pub enum Event {
         detail_size: u64,
         /// SHA-256 of the detail file, bound into the audit hash chain.
         detail_sha256: String,
+        /// The job that produced this batch.
+        job_id: Option<String>,
+        /// The search filter the job was created with. The detail file lists
+        /// *what* was deleted; this records *why that set existed*.
+        filter: Option<crate::message::search::EmailSearchFilter>,
+    },
+    /// The scheduled retention sweep permanently purged messages. Emitted
+    /// once per account per sweep (never per message): a GoBD auditor needs
+    /// the policy value and the cutoff, plus a way to resolve the exact ids.
+    RetentionPurged {
+        account_id: u64,
+        /// Messages removed in this sweep.
+        count: u64,
+        /// Effective cutoff: messages older than this were eligible.
+        cutoff_ms: i64,
+        /// The maximum-retention window that produced the cutoff.
+        window_days: u64,
+        /// Optional JSONL detail file listing the purged envelope ids. Absent
+        /// when audit detail is not configured (community) or the write failed.
+        detail_file: Option<String>,
+        detail_size: Option<u64>,
+        detail_sha256: Option<String>,
+    },
+    /// An account's retention policy changed. Recorded separately from the
+    /// generic `account.updated` row because the before/after values are the
+    /// evidence: "who shortened the retention window, and from what".
+    RetentionPolicyChanged {
+        user: String,
+        account_id: u64,
+        retention_days_before: Option<u64>,
+        retention_days_after: Option<u64>,
+        min_retention_days_before: Option<u64>,
+        min_retention_days_after: Option<u64>,
     },
     /// Raw EML file downloaded (export).
     EmailExported {
@@ -90,6 +138,78 @@ pub enum Event {
         user: String,
         account_id: u64,
         subject: Option<String>,
+    },
+    /// A source-mailbox cleanup preview was computed (read-only).
+    RemoteCleanupPreviewed {
+        user: String,
+        account_id: u64,
+        /// Kind of preview. Only `move` exists today.
+        kind: String,
+        candidates: u64,
+        verified: u64,
+        bytes: u64,
+    },
+    /// A scheduled or manual move run finished. `moved` counts messages moved
+    /// out of the source folders; nothing in this event is a permanent delete.
+    RemoteCleanupRunFinished {
+        /// `None` for the scheduler; audit trails render it as `system`.
+        user: Option<String>,
+        account_id: u64,
+        run_id: String,
+        trigger: String,
+        status: String,
+        moved: u64,
+        skipped: u64,
+        failed: u64,
+        bytes_moved: u64,
+        message: Option<String>,
+    },
+    /// One message was moved from a source folder into the cleanup folder.
+    /// Emitted per message so the trail names exactly what left the mailbox.
+    RemoteCleanupMessageMoved {
+        user: Option<String>,
+        account_id: u64,
+        source_mailbox: String,
+        source_uid: u32,
+        destination_folder: String,
+        message_id: String,
+        size: u64,
+    },
+    /// A guard rail (legal hold, stale backup, missing MOVE, missing
+    /// destination) refused a cleanup run before anything was moved.
+    RemoteCleanupBlocked {
+        user: Option<String>,
+        account_id: u64,
+        reason: String,
+    },
+    /// A repair re-fetched the message from IMAP when its archived blobs were
+    /// missing or unreadable, and/or rebuilt the index document from the
+    /// archived EML when its presentation fields were wrong — both in place,
+    /// keeping the envelope id. Emitted for every outcome the repair reports,
+    /// `failed` included: an attempt to rewrite archived content is worth
+    /// recording even when the fetched bytes did not match and nothing was
+    /// written.
+    EmailRepaired {
+        email_id: String,
+        user: String,
+        /// Absent when the request carried no peer address.
+        ip: Option<IpAddr>,
+        account_id: u64,
+        mailbox_id: u64,
+        subject: String,
+        /// `complete` (nothing was wrong), `repaired`, `partial` or `failed`.
+        status: String,
+        email_missing_before: bool,
+        email_missing_after: bool,
+        /// Whether the envelope document was re-derived from the archived EML.
+        index_updated: bool,
+        /// How many attachment blobs were suspected missing before / after.
+        missing_before: usize,
+        missing_after: usize,
+        /// Set when the fetched content validated but the write was skipped
+        /// because a backup window was open.
+        skipped_due_to_backup: bool,
+        error: Option<String>,
     },
     /// Facet tags added/removed on emails.
     EmailTagged {
@@ -113,6 +233,9 @@ pub enum Event {
         account_id: u64,
         mailbox_id: u64,
         filename: Option<String>,
+        /// See [`Event::EmailViewed`]: the view that made the parent message
+        /// readable, when it was not a direct grant.
+        via_view: Option<ViewAccess>,
     },
     UserLoggedIn {
         user: String,
@@ -179,6 +302,9 @@ pub enum Event {
         ext: Option<String>,
         /// Content hash of the parent email (EML), when known.
         parent_content_hash: Option<String>,
+        /// See [`Event::EmailViewed`]: the view that made the parent message
+        /// readable, when it was not a direct grant.
+        via_view: Option<ViewAccess>,
     },
     AccountCreated {
         created_by: String,
@@ -189,6 +315,11 @@ pub enum Event {
         updated_by: String,
         account_id: u64,
         email: String,
+        /// Set when the update changed a view's sources or filters. An
+        /// `account.updated` line on its own cannot distinguish a rename from
+        /// dropping a filter, and dropping a filter is a widening of someone
+        /// else's visibility.
+        view_change: Option<crate::account::migration::ViewConfigChange>,
     },
     AccountRemoved {
         removed_by: String,
@@ -251,11 +382,16 @@ pub enum Event {
         user: String,
         oauth2_id: u64,
         name: String,
+        /// Type the configuration was created with. A public client holds no
+        /// secret, so nothing else in the record implies it.
+        client_type: OAuth2ClientType,
     },
     OAuth2ConfigUpdated {
         user: String,
         oauth2_id: u64,
         name: String,
+        /// Effective type after the update, not the requested one.
+        client_type: OAuth2ClientType,
     },
     OAuth2ConfigRemoved {
         user: String,
@@ -301,6 +437,9 @@ pub enum Event {
     SsoLogout {
         user: String,
     },
+    /// Pro/Enterprise: an admin changed the OIDC SSO configuration from the
+    /// WebUI. The client secret is never part of the event.
+    SsoConfigUpdated { user: String },
     LicenseUploaded {
         user: String,
         email: String,
@@ -364,6 +503,10 @@ pub enum Event {
         user: String,
         export_id: String,
         saved_search_id: String,
+        /// The saved search's name, or the caller's label for an ad-hoc
+        /// export (e.g. "All images"). Empty `saved_search_id` plus a name is
+        /// how an ad-hoc export reads in the audit trail.
+        saved_search_name: String,
         format: String,
         account_count: u64,
         email_count: u64,
@@ -373,6 +516,7 @@ pub enum Event {
         user: String,
         export_id: String,
         saved_search_id: String,
+        saved_search_name: String,
         exported: u64,
         failed: u64,
         artifact_size: u64,
@@ -395,6 +539,7 @@ pub enum Event {
         user: String,
         export_id: String,
         saved_search_id: String,
+        saved_search_name: String,
         error: String,
     },
     /// A batch export job was cancelled by its owner.
@@ -446,6 +591,9 @@ pub enum Event {
         ip: Option<IpAddr>,
         reason: String,
     },
+    /// Enterprise: an admin changed the LDAP/AD configuration from the WebUI.
+    /// The service-account password is never part of the event.
+    LdapConfigUpdated { user: String },
     /// The SIEM webhook forwarder gave up on a batch after exhausting its
     /// retries (Enterprise). The cursor is NOT advanced, so the batch is
     /// retried on the next cycle (at-least-once delivery).
@@ -466,6 +614,55 @@ pub enum Event {
     /// integrity schedule and retention, TSP anchoring interval) was changed
     /// by an admin from the WebUI.
     ComplianceConfigUpdated { user: String },
+    /// Pro/Enterprise: the audit trail itself was queried or its hash chain
+    /// verified. Reading the compliance evidence is itself security-relevant —
+    /// an operator who can inspect the trail without leaving a trace of their
+    /// own would be a separation-of-duties hole.
+    AuditLogQueried {
+        user: String,
+        /// Which surface asked: `list`, `by_email`, or `verify`.
+        scope: String,
+        /// The email the query was narrowed to, when the caller asked about
+        /// one message's history.
+        email_id: Option<String>,
+        ip: Option<IpAddr>,
+    },
+    /// A GDPR Art. 17 erasure request was recorded (Enterprise).
+    ///
+    /// This is the record GoBD and the GDPR pull in opposite directions about:
+    /// a data subject asked for their data to be erased, an operator assessed
+    /// whether a statutory retention obligation stands in the way, and — when
+    /// one does not — the erasure was submitted for a second signature.
+    ///
+    /// Deliberately its own event rather than a `reason` string on
+    /// `ApprovalRequested`: the data subject, the search criteria and the
+    /// assessment are what a supervisory authority asks to see, and a free-text
+    /// field that happens to contain them is not evidence anyone can filter or
+    /// machine-read. The assessment is also required at submission — a request
+    /// with no stated basis is not something to ask a second person to sign.
+    GdprErasureRequested {
+        /// The operator who recorded the request.
+        user: String,
+        /// The data subject the request is about, as the operator recorded it
+        /// (e-mail address, name, customer number).
+        subject: String,
+        /// How the affected messages were identified — the criteria searched.
+        criteria: String,
+        /// The operator's written assessment of why no statutory retention
+        /// obligation applies.
+        assessment: String,
+        /// How many messages the request names.
+        messages: u64,
+        account_ids: Vec<u64>,
+        /// `true` when dual control queued the request for a second person,
+        /// `false` when the policy is off and the erasure ran directly on this
+        /// one signature. The distinction is the whole point of the record: a
+        /// reader has to be able to tell an authorized erasure from an
+        /// unaccompanied one.
+        queued: bool,
+        /// The approval request id, when the erasure was queued.
+        request_id: Option<String>,
+    },
     /// A dual-control approval request was created and awaits a second
     /// person's decision (Enterprise). Nothing has happened to the target yet
     /// — this is the "first person" half of the two-person rule.

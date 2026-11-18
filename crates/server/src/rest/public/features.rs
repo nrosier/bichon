@@ -24,6 +24,8 @@ struct FeaturesResponse {
     features: Vec<String>,
     edition: &'static str,
     version: String,
+    sso_enabled: bool,
+    sso_supported: bool,
 }
 
 #[handler]
@@ -32,5 +34,7 @@ pub async fn get_features() -> impl IntoResponse {
         features: crate::rest::oidc::advertised_features(),
         edition: "community",
         version: env!("CARGO_PKG_VERSION").to_string(),
+        sso_enabled: bichon_core::oidc::is_available(),
+        sso_supported: true,
     })
 }
