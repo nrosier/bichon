@@ -26,6 +26,7 @@
 //!
 //! [`handlers`] holds the endpoints themselves.
 
+use crate::common::auth::ApiGuard;
 use bichon_core::oidc::config::callback_path;
 use bichon_core::settings::cli::SETTINGS;
 use poem::web::Redirect;
@@ -33,14 +34,17 @@ use poem::{get, post, Endpoint, EndpointExt, IntoResponse, Request, Response, Ro
 
 use handlers::{
     oidc_callback, oidc_config, oidc_handoff, oidc_local_logout, oidc_login, oidc_logout,
+    oidc_status,
 };
 
+pub mod admin;
 pub mod handlers;
 
 /// Mount the OIDC endpoints.
 ///
-/// Unauthenticated by design: this is how a browser without a token obtains
-/// one. Each handler does its own validation.
+/// The `/api/auth/oidc/*` routes are unauthenticated by design: this is how a browser without a token obtains
+/// one. Each handler does its own validation. The `/api/v1/sso*` admin routes
+/// sit behind `ApiGuard` and check `system:root` or `user:manage` themselves.
 pub fn attach(route: Route) -> Route {
     route
         .nest("/api/auth/oidc/config", get(oidc_config))
@@ -49,6 +53,12 @@ pub fn attach(route: Route) -> Route {
         .nest("/api/auth/oidc/handoff", post(oidc_handoff))
         .nest("/api/auth/oidc/local-logout", post(oidc_local_logout))
         .nest("/api/auth/oidc/logout", get(oidc_logout))
+        .nest("/api/auth/oidc/status", get(oidc_status))
+        .at(
+            "/api/v1/sso",
+            get(admin::get_sso).put(admin::put_sso).with(ApiGuard),
+        )
+        .at("/api/v1/sso/test", post(admin::test_sso).with(ApiGuard))
 }
 
 /// What `/api/v1/features` advertises, so the SPA can offer the SSO button

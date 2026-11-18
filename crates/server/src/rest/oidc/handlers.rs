@@ -21,7 +21,6 @@
 //! These sit outside `ApiGuard` because they are what an unauthenticated
 //! browser uses to obtain a session in the first place.
 
-use bichon_core::error::BichonError;
 use bichon_core::ext::event_bus::{emit, Event};
 use bichon_core::oidc::config::OidcConfig;
 use bichon_core::oidc::{flow, store};
@@ -74,11 +73,11 @@ pub async fn oidc_login(Query(params): Query<LoginParams>) -> Response {
         Err(e) => return sign_in_error("sso_unavailable", &e),
     };
 
-    match flow::begin(&config, safe_redirect(params.redirect)).await {
+    match flow::begin_coded(&config, safe_redirect(params.redirect)).await {
         Ok(url) => Redirect::temporary(url).into_response(),
         Err(e) => {
             error!("could not start the OIDC login flow: {}", e);
-            sign_in_error("sso_start_failed", &e)
+            sign_in_error(&e.code(), &e)
         }
     }
 }
@@ -94,48 +93,44 @@ pub struct CallbackParams {
 
 /// The provider's redirect target.
 ///
-/// On success the browser is sent to the SPA with a one-shot handoff id — never
+/// On success the browser is sent to the SPA with a one-shot handoff id, never
 /// with the access token itself, which would end up in history and logs.
+///
+/// Every failure redirects with a stable `oidc_error=<code>` and nothing else.
+/// This endpoint is public and reachable without any valid `state`, so nothing
+/// the provider or a caller sent (`error_description` in particular) may be
+/// echoed into the page: that would be a phishing surface on Bichon's own
+/// origin. The sentence goes to the server log.
 #[handler]
 pub async fn oidc_callback(Query(params): Query<CallbackParams>, req: &Request) -> Response {
-    if let Some(error) = params.error.as_deref() {
-        // Logged in full, shown as a fixed string. This endpoint is public and
-        // reachable without any valid `state`, so `error_description` is not
-        // necessarily the provider's words at all: anyone can send a victim
-        // `/api/auth/oidc/callback?error=x&error_description=<anything>` and,
-        // if it were echoed, have Bichon render their text in an error toast on
-        // Bichon's own origin — a ready-made phishing surface.
-        warn!(
-            "the identity provider declined the sign-in (error={:?}, description={:?})",
-            error, params.error_description
-        );
-        return redirect_to_sign_in(&format!(
-            "?oidc_error={}",
-            urlencoding::encode(
-                "The identity provider declined the sign-in. Check the Bichon server log for what it reported."
-            )
-        ));
-    }
-
-    let (Some(code), Some(state)) = (params.code.as_deref(), params.state.as_deref()) else {
-        return redirect_to_sign_in(&format!(
-            "?oidc_error={}",
-            urlencoding::encode(
-                "The sign-in response from the identity provider was incomplete. Please try again."
-            )
-        ));
-    };
-
     let config = match OidcConfig::load() {
         Ok(config) => config,
         Err(e) => return sign_in_error("sso_unavailable", &e),
     };
 
-    let completed = match flow::complete(&config, state, code).await {
+    if let Some(error) = params.error.as_deref() {
+        warn!(
+            "the identity provider declined the sign-in (error={:?}, description={:?})",
+            error, params.error_description
+        );
+        return sign_in_error(
+            "sso_declined",
+            &"the identity provider declined the sign-in",
+        );
+    }
+
+    let (Some(code), Some(state)) = (params.code.as_deref(), params.state.as_deref()) else {
+        return sign_in_error(
+            "sso_incomplete",
+            &"the callback was missing 'code' or 'state'",
+        );
+    };
+
+    let completed = match flow::complete_coded(&config, state, code).await {
         Ok(completed) => completed,
         Err(e) => {
             error!("the OIDC callback failed: {}", e);
-            return sign_in_error("sso_failed", &e);
+            return sign_in_error(&e.code(), &e);
         }
     };
 
@@ -153,6 +148,13 @@ pub async fn oidc_callback(Query(params): Query<CallbackParams>, req: &Request) 
         "?oidc_handoff={}",
         urlencoding::encode(&completed.handoff_id)
     ))
+}
+
+/// Whether SSO is usable right now, publicly and without any outbound request
+/// unless SSO is active (that guarantee lives in core).
+#[handler]
+pub async fn oidc_status() -> impl IntoResponse {
+    Json(bichon_core::oidc::status().await)
 }
 
 #[derive(Deserialize)]
@@ -282,12 +284,11 @@ fn redirect_to_sign_in(query: &str) -> Response {
     Redirect::temporary(app_url(&format!("/sign-in{}", query))).into_response()
 }
 
-fn sign_in_error(code: &str, error: &BichonError) -> Response {
-    redirect_to_sign_in(&format!(
-        "?oidc_error={}&oidc_error_code={}",
-        urlencoding::encode(&error.to_string()),
-        urlencoding::encode(code)
-    ))
+/// Redirect to the sign-in page with a machine code only. `detail` is logged,
+/// never sent to the browser.
+fn sign_in_error(code: &str, detail: &dyn std::fmt::Display) -> Response {
+    warn!("OIDC sign-in failed ({}): {}", code, detail);
+    redirect_to_sign_in(&format!("?oidc_error={}", urlencoding::encode(code)))
 }
 
 fn bearer_token(req: &Request) -> Option<String> {
