@@ -38,6 +38,14 @@ use tokio::{
 
 pub static BLOB_MANAGER: LazyLock<BlobManager> = LazyLock::new(BlobManager::new);
 
+/// Free-space floor on the blob volume. Writes that would breach it are
+/// refused, and the watchdog requests a graceful shutdown when the volume
+/// falls below it.
+pub const MIN_FREE_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// How often the blob engine checks the volume against [`MIN_FREE_BYTES`].
+pub const DISK_CHECK_INTERVAL_SECS: u64 = 5;
+
 pub struct DetachedEmail {
     pub email: (String, Bytes),
     pub attachments: Option<Vec<(String, Bytes)>>,
@@ -75,63 +83,110 @@ impl BlobManager {
     }
 
     fn process_detached_email(eml: DetachedEmail, engine: &Engine) {
-        let (email_hash, email_data) = eml.email;
-        let email_key = match hex_to_key(&email_hash) {
-            Ok(k) => k,
-            Err(e) => {
-                tracing::error!("{:#?}", e);
-                return;
-            }
-        };
-        match engine.exists(&email_key) {
-            Ok(false) => {
-                if let Err(e) = engine.put(email_key, &email_data, Codec::Lz4) {
-                    tracing::error!("CRITICAL: Failed to insert email blob: {:?}", e);
-                }
-            }
-            Err(e) => tracing::error!("blob engine error: {:?}", e),
-            Ok(true) => {
-                tracing::debug!("Email blob already exists (dedup): {}", &email_hash);
-            }
-        }
-
-        if let Some(attachments) = eml.attachments {
-            for (a_hash, a_data) in attachments {
-                let a_key = match hex_to_key(&a_hash) {
-                    Ok(k) => k,
-                    Err(e) => {
-                        tracing::error!("{:#?}", e);
-                        continue;
-                    }
-                };
-                match engine.exists(&a_key) {
-                    Ok(false) => {
-                        if let Err(e) = engine.put(a_key, &a_data, Codec::Lz4) {
-                            tracing::error!("CRITICAL: Failed to insert attachment blob: {:?}", e);
-                        }
-                    }
-                    Err(e) => tracing::error!("blob engine error: {:?}", e),
-                    Ok(true) => {
-                        tracing::debug!("Attachment blob already exists (dedup): {}", &a_hash);
-                    }
-                }
-            }
+        if let Err(e) = Self::write_detached_email(eml, engine, false) {
+            tracing::error!("CRITICAL: Failed to insert blob: {:#?}", e);
         }
     }
 
-    pub fn new() -> Self {
-        let blob_dir = DATA_DIR_MANAGER.storage_dir.join("blobs");
+    /// Persists every blob of `eml`, either write-once (`replace == false`, the
+    /// normal content-addressed dedup) or overwriting whatever is stored under
+    /// each key.
+    ///
+    /// The overwriting mode exists for repair: a blob can be present yet
+    /// unreadable, and the first-write-wins rule would then make that record
+    /// permanently unhealable. Deleting the key first records the old bytes as
+    /// deleted for GC accounting; the tombstone is then replaced by the new
+    /// record, so a later `exists` sees the fresh data.
+    fn write_detached_email(
+        eml: DetachedEmail,
+        engine: &Engine,
+        replace: bool,
+    ) -> BichonResult<()> {
+        let (email_hash, email_data) = eml.email;
+        Self::write_detached_blob(engine, &email_hash, &email_data, replace)?;
 
+        if let Some(attachments) = eml.attachments {
+            for (a_hash, a_data) in attachments {
+                if let Err(e) = Self::write_detached_blob(engine, &a_hash, &a_data, replace) {
+                    // One corrupt attachment hash must not take the record's
+                    // other blobs with it on the normal path. A repair reports
+                    // the failure instead: the caller re-diagnoses and the
+                    // report shows what is still broken.
+                    if replace {
+                        return Err(e);
+                    }
+                    tracing::error!("{:#?}", e);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn write_detached_blob(
+        engine: &Engine,
+        hash: &str,
+        data: &Bytes,
+        replace: bool,
+    ) -> BichonResult<()> {
+        let key = hex_to_key(hash)?;
+        if replace {
+            engine
+                .delete(&key)
+                .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
+        } else if engine
+            .exists(&key)
+            .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?
+        {
+            tracing::debug!("Blob already exists (dedup): {}", hash);
+            return Ok(());
+        }
+        engine
+            .put(key, data, Codec::Lz4)
+            .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))
+    }
+
+    pub fn new() -> Self {
+        Self::open(DATA_DIR_MANAGER.storage_dir.join("blobs"))
+    }
+
+    /// Opens a manager rooted at `blob_dir`. Split out from [`Self::new`] so a
+    /// test can run against a private directory: the writer task below is bound
+    /// to whichever runtime created the manager, so a test that used the
+    /// process-global `BLOB_MANAGER` would silently depend on which other test
+    /// initialized it first and on that test's runtime still being alive.
+    pub(crate) fn open(blob_dir: std::path::PathBuf) -> Self {
         let mut config = Config::default();
         config.default_codec = Codec::Zstd;
         config.compress_threshold = 1024;
         config.flush_interval_secs = 60;
         config.gc_interval_secs = 300;
+        // Leave 1 GiB of headroom: refuse writes that would breach it, and
+        // request a graceful shutdown if the volume falls below it. The
+        // shutdown path is still allowed to flush queued blobs into the
+        // reserve; a genuinely full volume will surface as write errors.
+        config.min_free_bytes = MIN_FREE_BYTES;
+        config.disk_check_interval_secs = DISK_CHECK_INTERVAL_SECS;
 
         let engine = Engine::open(&blob_dir, config)
             .expect("Failed to initialize blob engine: Check disk space and permissions.");
 
         let engine = Arc::new(engine);
+
+        // Low disk does not kill the process: it requests the normal graceful
+        // shutdown, and the drain path below is allowed to keep writing even
+        // though the volume is below the reserve.
+        engine.set_low_disk_callback({
+            let engine = Arc::downgrade(&engine);
+            move || {
+                tracing::error!(
+                    "Blob storage is below the free-space floor; requesting a graceful shutdown"
+                );
+                if let Some(engine) = engine.upgrade() {
+                    engine.allow_writes_below_free_floor(true);
+                }
+                SIGNAL_MANAGER.trigger_shutdown();
+            }
+        });
 
         let (sender, mut receiver) = mpsc::channel::<DetachedEmail>(100);
 
@@ -167,6 +222,9 @@ impl BlobManager {
                         }
                     }
                     _ = shutdown.recv() => {
+                        // Graceful shutdown: queued blobs must still be
+                        // flushed even if the volume is below the reserve.
+                        engine_bg.allow_writes_below_free_floor(true);
                         receiver.close();
                         let mut remaining = Vec::new();
                         while let Some(eml) = receiver.recv().await {
@@ -209,6 +267,17 @@ impl BlobManager {
             self.pending.fetch_sub(1, Ordering::AcqRel);
             tracing::error!("BlobManager channel closed, email lost: {:#?}", e);
         }
+    }
+
+    /// Write `email` and its attachments, overwriting any bytes already stored
+    /// under the same keys.
+    ///
+    /// This is the write path for repairing an unreadable blob: the queued path
+    /// is write-once, so it can never replace a present-but-corrupt record. The
+    /// write is synchronous (compression + append), so callers on an async
+    /// runtime should run it in `spawn_blocking`.
+    pub fn replace(&self, email: DetachedEmail) -> BichonResult<()> {
+        Self::write_detached_email(email, &self.engine, true)
     }
 
     /// Number of emails queued but not yet persisted to the blob store.
@@ -305,4 +374,182 @@ impl BlobManager {
 pub async fn get_reader(account_id: u64, eid: String) -> BichonResult<Cursor<Bytes>> {
     let (_, data) = reattach_eml_content_self_healing(account_id, eid).await?;
     Ok(Cursor::new(data))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A private manager rooted at its own temp dir. The process-global
+    /// `BLOB_MANAGER` is deliberately avoided: its writer is a spawned task
+    /// bound to whichever runtime first dereferenced the `LazyLock`, so sharing
+    /// it across test modules makes the outcome depend on execution order (and
+    /// on that first runtime still being alive).
+    fn temp_manager(suffix: &str) -> (BlobManager, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("bichon-blob-{suffix}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        (BlobManager::open(dir.clone()), dir)
+    }
+
+    /// Drop the manager and let the writer loop notice the closed channel, so
+    /// the engine releases its file handles before the temp dir is removed.
+    async fn close(manager: BlobManager, dir: std::path::PathBuf) -> std::path::PathBuf {
+        drop(manager);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        dir
+    }
+
+    /// First write wins: re-queueing an existing key must not replace the
+    /// archived bytes. This is what makes a repeated detach (re-ingest, repair)
+    /// idempotent rather than a way to overwrite the archive.
+    #[test]
+    fn queued_blobs_are_deduplicated_and_never_overwritten() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let dir = runtime.block_on(async {
+            let (manager, dir) = temp_manager("dedup");
+
+            let email_hash = crate::utils::compute_content_hash(b"original email");
+            let attachment_hash = crate::utils::compute_content_hash(b"original attachment");
+
+            manager
+                .queue(DetachedEmail {
+                    email: (email_hash.clone(), Bytes::from_static(b"original email")),
+                    attachments: Some(vec![(
+                        attachment_hash.clone(),
+                        Bytes::from_static(b"original attachment"),
+                    )]),
+                })
+                .await;
+            manager.drain().await;
+            assert_eq!(manager.pending(), 0);
+
+            assert_eq!(
+                manager.get_email(&email_hash).unwrap(),
+                Some(Bytes::from_static(b"original email"))
+            );
+            assert_eq!(
+                manager.get_attachment(&attachment_hash).unwrap(),
+                Some(Bytes::from_static(b"original attachment"))
+            );
+
+            // Same keys, different bytes.
+            manager
+                .queue(DetachedEmail {
+                    email: (email_hash.clone(), Bytes::from_static(b"tampered email")),
+                    attachments: Some(vec![(
+                        attachment_hash.clone(),
+                        Bytes::from_static(b"tampered attachment"),
+                    )]),
+                })
+                .await;
+            manager.drain().await;
+
+            assert_eq!(
+                manager.get_email(&email_hash).unwrap(),
+                Some(Bytes::from_static(b"original email"))
+            );
+            assert_eq!(
+                manager.get_attachment(&attachment_hash).unwrap(),
+                Some(Bytes::from_static(b"original attachment"))
+            );
+
+            close(manager, dir).await
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The repair path must be able to replace a blob whose archived bytes are
+    /// unreadable; the queued path deliberately cannot (see the test above).
+    #[test]
+    fn replace_overwrites_archived_bytes_and_creates_missing_keys() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let dir = runtime.block_on(async {
+            let (manager, dir) = temp_manager("replace");
+
+            let email_hash = crate::utils::compute_content_hash(b"corrupt email");
+            let attachment_hash = crate::utils::compute_content_hash(b"corrupt attachment");
+            manager
+                .queue(DetachedEmail {
+                    email: (email_hash.clone(), Bytes::from_static(b"corrupt email")),
+                    attachments: Some(vec![(
+                        attachment_hash.clone(),
+                        Bytes::from_static(b"corrupt attachment"),
+                    )]),
+                })
+                .await;
+            manager.drain().await;
+
+            manager
+                .replace(DetachedEmail {
+                    email: (email_hash.clone(), Bytes::from_static(b"good email")),
+                    attachments: Some(vec![(
+                        attachment_hash.clone(),
+                        Bytes::from_static(b"good attachment"),
+                    )]),
+                })
+                .expect("replace present blobs");
+            assert_eq!(
+                manager.get_email(&email_hash).unwrap(),
+                Some(Bytes::from_static(b"good email"))
+            );
+            assert_eq!(
+                manager.get_attachment(&attachment_hash).unwrap(),
+                Some(Bytes::from_static(b"good attachment"))
+            );
+
+            // Replace must also create a key that was never stored (a repair
+            // may run after the blob was garbage-collected).
+            let fresh_hash = crate::utils::compute_content_hash(b"fresh email");
+            manager
+                .replace(DetachedEmail {
+                    email: (fresh_hash.clone(), Bytes::from_static(b"fresh email")),
+                    attachments: None,
+                })
+                .expect("replace absent blob");
+            assert_eq!(
+                manager.get_email(&fresh_hash).unwrap(),
+                Some(Bytes::from_static(b"fresh email"))
+            );
+
+            close(manager, dir).await
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A malformed hash (a corrupt envelope field) must be dropped on the floor
+    /// rather than panic — and must not take the rest of the batch with it.
+    #[test]
+    fn a_malformed_hash_is_skipped_without_dropping_the_batch() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let dir = runtime.block_on(async {
+            let (manager, dir) = temp_manager("badkey");
+
+            let good_hash = crate::utils::compute_content_hash(b"good email");
+            manager
+                .queue(DetachedEmail {
+                    email: ("not-hex".to_string(), Bytes::from_static(b"junk")),
+                    attachments: None,
+                })
+                .await;
+            manager
+                .queue(DetachedEmail {
+                    email: (good_hash.clone(), Bytes::from_static(b"good email")),
+                    attachments: None,
+                })
+                .await;
+            manager.drain().await;
+            assert_eq!(manager.pending(), 0);
+
+            assert_eq!(
+                manager.get_email(&good_hash).unwrap(),
+                Some(Bytes::from_static(b"good email"))
+            );
+
+            close(manager, dir).await
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

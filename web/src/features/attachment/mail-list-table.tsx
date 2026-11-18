@@ -17,10 +17,9 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 
-import { dateFnsLocaleMap, formatBytes } from "@/lib/utils"
+import { dateFnsLocaleMap, formatBytes, formatSender } from "@/lib/utils"
 import { format, formatDistanceToNow } from "date-fns"
 import { Skeleton } from "@/components/ui/skeleton"
-import { Checkbox } from "@/components/ui/checkbox"
 import { useAttachmentContext } from "./context"
 import { useTranslation } from 'react-i18next'
 import { enUS } from "date-fns/locale"
@@ -51,41 +50,14 @@ export function AttachmentListTable({
   const { t, i18n } = useTranslation()
 
   const locale = dateFnsLocaleMap[i18n.language.toLowerCase()] ?? enUS
-  const { selected, setSelected, setOpen, setCurrentAttachment, dateDisplay } = useAttachmentContext()
+  const { setOpen, setCurrentAttachment, dateDisplay } = useAttachmentContext()
 
   const columns: ColumnDef<AttachmentModel>[] = [
-    {
-      accessorKey: "id",
-      header: () => (
-        <Checkbox
-          checked={
-            totalSelected === items.length && items.length > 0
-              ? true
-              : totalSelected > 0
-                ? "indeterminate"
-                : false
-          }
-          onCheckedChange={handleToggleAll}
-          className="h-4 w-4"
-        />
-      ),
-      cell: ({ row }) => (
-        <Checkbox
-          checked={hasSelected(row.original.account_id, row.original.id)}
-          onCheckedChange={() => toggleSelected(row.original.account_id, row.original.id)}
-          onClick={(e) => e.stopPropagation()}
-          className="h-4 w-4 shrink-0"
-        />
-      ),
-      meta: { className: 'text-left text-sm' },
-      minSize: 25,
-      maxSize: 25,
-    },
     {
       accessorKey: "source",
       header: t('attachment.source'),
       cell: ({ row }) => {
-        const { from, account_email, mailbox_name, account_id, mailbox_id } = row.original;
+        const { from, from_name, wire_from, account_email, mailbox_name, account_id, mailbox_id } = row.original;
         const { setFilter } = useSearchAttachments();
         const accountPrefix = account_email.split('@')[0];
 
@@ -93,13 +65,14 @@ export function AttachmentListTable({
           <div className="flex flex-col py-0.5 min-w-0 group">
             <div
               className="cursor-pointer hover:text-primary transition-colors flex items-center gap-1.5"
+              title={wire_from ? `via ${wire_from}` : undefined}
               onClick={(e) => {
                 e.stopPropagation();
                 setFilter((prev: any) => ({ ...prev, from: from }));
               }}
             >
               <LongText className="text-xs truncate">
-                {from}
+                {formatSender(from_name, from)}
               </LongText>
             </div>
 
@@ -135,31 +108,33 @@ export function AttachmentListTable({
       accessorKey: "subject",
       header: t('attachment.subject'),
       cell: ({ row }) => {
+        const subject = row.original.subject || t('mail.noSubject');
         return (
           <div className="group relative flex items-center w-full min-w-0 h-full px-2 py-0.5 overflow-hidden">
             <div className="absolute left-0 top-0 bottom-0 w-[2px] bg-primary opacity-0 group-hover:opacity-100 transition-opacity" />
-
-            <div className="text-xs flex flex-wrap gap-x-1 min-w-0 flex-1">
-              <span className="flex items-center">
-                <button
-                  type="button"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setCurrentAttachment(row.original);
-                    setOpen("display");
-                  }}
-                  className="hover:text-primary hover:underline transition-colors truncate"
-                >
-                  <LongText>{row.original.subject}</LongText>
-                </button>
-              </span>
-            </div>
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                // Open by the row's account + envelope id, never by the
+                // rendered subject (a message may have none).
+                setCurrentAttachment(row.original);
+                setOpen("display");
+              }}
+              className="w-full min-w-0 text-left text-xs hover:text-primary hover:underline transition-colors"
+            >
+              {/* LongText truncates with an ellipsis and shows the full
+                  subject in a tooltip when the column is too narrow. */}
+              <LongText contentClassName="max-w-sm whitespace-normal break-words">
+                {subject}
+              </LongText>
+            </button>
           </div>
         );
       },
       meta: { className: 'text-left text-xs' },
-      minSize: 500,
-      maxSize: 500,
+      minSize: 380,
+      maxSize: 380,
     },
     {
       accessorKey: "name",
@@ -260,51 +235,11 @@ export function AttachmentListTable({
     },
   ]
 
-  const handleToggleAll = () => {
-    const total = Array.from(selected.values()).reduce((sum, set) => sum + set.size, 0)
-
-    if (total === items.length && items.length > 0) {
-      setSelected(new Map())
-    } else {
-      setSelected(prev => {
-        const next = new Map(prev)
-        for (const item of items) {
-          const set = new Set(next.get(item.account_id) || [])
-          set.add(item.id)
-          next.set(item.account_id, set)
-        }
-        return next
-      })
-    }
-  }
-
-  const toggleSelected = (accountId: number, mailId: string) => {
-    setSelected(prev => {
-      const next = new Map(prev)
-      const set = new Set(next.get(accountId) || [])
-
-      if (set.has(mailId)) {
-        set.delete(mailId)
-        if (set.size === 0) next.delete(accountId)
-        else next.set(accountId, set)
-      } else {
-        set.add(mailId)
-        next.set(accountId, set)
-      }
-      return next
-    })
-  }
-
-  const totalSelected = Array.from(selected.values()).reduce((sum, set) => sum + set.size, 0)
-
-  const hasSelected = (accountId: number, mailId: string) => selected.get(accountId)?.has(mailId) ?? false
-
   if (isLoading) {
     return (
       <div className="divide-y divide-border">
         {Array.from({ length: 30 }).map((_, i) => (
           <div key={i} className="flex items-center gap-2 px-2 py-1.5">
-            <Skeleton className="h-3 w-3" />
             <Skeleton className="h-3 w-3 rounded-full" />
             <Skeleton className="h-3 flex-1" />
             <Skeleton className="h-2.5 w-16" />
@@ -319,7 +254,13 @@ export function AttachmentListTable({
       <SearchTable
         data={items}
         columns={columns}
-        onRowClick={() => { }}
+        onRowClick={(e, row) => {
+          const target = e.target as HTMLElement
+          // Interactive elements handle their own clicks.
+          if (target.closest('button, a, input, [role="menuitem"]')) return
+          setCurrentAttachment(row.original)
+          setOpen('display')
+        }}
         setSortBy={setSortBy}
         setSortOrder={setSortOrder}
       >

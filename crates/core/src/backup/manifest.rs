@@ -110,16 +110,25 @@ pub struct TantivyRef {
 pub struct ManifestObjects {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memdb: Option<ObjectRef>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub imap_uid: Option<ObjectRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blob_segments: Vec<SegmentRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audit: Option<AuditObjects>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integrity: Option<ObjectRef>,
+    /// Source-UID tombstones package (`tombstones/`). Absent in backups
+    /// written before this artifact existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tombstones: Option<ObjectRef>,
+    /// Pro dual-control frozen message sets (`approval-details/`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_details: Option<ObjectRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<ObjectRef>,
+    /// Deployment identity package (`instance-id` + optional `license.txt`).
+    /// Absent in backups written before this artifact existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment: Option<ObjectRef>,
     /// Tantivy index copies (envelope + attachment). Derived data —
     /// recreated after a restore instead of being copied back.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -169,7 +178,6 @@ impl Manifest {
         };
         match &art.logical {
             ArtifactKey::Memdb => self.objects.memdb = Some(obj),
-            ArtifactKey::ImapUid => self.objects.imap_uid = Some(obj),
             ArtifactKey::BlobSegment(seg_id) => {
                 self.objects.blob_segments.push(SegmentRef {
                     seg_id: *seg_id,
@@ -201,7 +209,10 @@ impl Manifest {
                 });
             }
             ArtifactKey::Integrity => self.objects.integrity = Some(obj),
+            ArtifactKey::Tombstones => self.objects.tombstones = Some(obj),
+            ArtifactKey::ApprovalDetails => self.objects.approval_details = Some(obj),
             ArtifactKey::TimestampAnchor => self.objects.timestamp = Some(obj),
+            ArtifactKey::DeploymentIdentity => self.objects.deployment = Some(obj),
         }
         Ok(())
     }
@@ -226,9 +237,11 @@ impl Manifest {
         let mut keys = Vec::new();
         for slot in [
             &self.objects.memdb,
-            &self.objects.imap_uid,
             &self.objects.integrity,
+            &self.objects.tombstones,
+            &self.objects.approval_details,
             &self.objects.timestamp,
+            &self.objects.deployment,
         ]
         .into_iter()
         .flatten()
@@ -255,9 +268,11 @@ impl Manifest {
         let mut out = Vec::new();
         for slot in [
             &self.objects.memdb,
-            &self.objects.imap_uid,
             &self.objects.integrity,
+            &self.objects.tombstones,
+            &self.objects.approval_details,
             &self.objects.timestamp,
+            &self.objects.deployment,
         ]
         .into_iter()
         .flatten()
@@ -368,16 +383,20 @@ mod tests {
     fn object_keys_lists_every_reference() {
         let mut m = Manifest::new("m-1".to_string(), "manual", None);
         m.add_artifact(&artifact(ArtifactKey::Memdb, 0x01, 1)).unwrap();
-        m.add_artifact(&artifact(ArtifactKey::ImapUid, 0x02, 1)).unwrap();
         m.add_artifact(&artifact(ArtifactKey::BlobSegment(1), 0x03, 1)).unwrap();
         m.add_artifact(&artifact(ArtifactKey::BlobSegment(2), 0x04, 1)).unwrap();
         m.add_artifact(&artifact(ArtifactKey::AuditBase, 0x05, 1)).unwrap();
         m.add_artifact(&artifact(ArtifactKey::AuditDelta(1, 2), 0x06, 1)).unwrap();
         m.add_artifact(&artifact(ArtifactKey::Integrity, 0x07, 1)).unwrap();
         m.add_artifact(&artifact(ArtifactKey::TimestampAnchor, 0x08, 1)).unwrap();
+        m.add_artifact(&artifact(ArtifactKey::DeploymentIdentity, 0x09, 1)).unwrap();
 
         let keys = m.object_keys();
-        assert_eq!(keys.len(), 8, "memdb+uid+2 segs+audit base+delta+integrity+timestamp");
+        assert_eq!(
+            keys.len(),
+            8,
+            "memdb+2 segs+audit base+delta+integrity+timestamp+deployment"
+        );
         assert_eq!(m.object_refs().len(), 8);
         // Content addressing ⇒ distinct bytes ⇒ distinct keys.
         let uniq: std::collections::HashSet<&str> = keys.iter().copied().collect();
@@ -408,5 +427,35 @@ mod tests {
         let audit = m.objects.audit.unwrap();
         assert_eq!(audit.cursor, 7);
         assert_eq!(audit.cumulative_delta_bytes, 0);
+    }
+
+    #[test]
+    fn tombstones_artifact_is_wired_into_the_manifest() {
+        let mut m = Manifest::new("m-tomb".to_string(), "manual", None);
+        let art = artifact(ArtifactKey::Tombstones, 0x77, 4096);
+        m.add_artifact(&art).unwrap();
+        let slot = m
+            .objects
+            .tombstones
+            .as_ref()
+            .expect("tombstones slot must be populated");
+        assert_eq!(slot.bytes, 4096);
+        assert_eq!(slot.sha256, hex::encode([0x77u8; 32]));
+        assert!(m.object_keys().contains(&slot.key.as_str()));
+        assert!(m
+            .object_refs()
+            .iter()
+            .any(|(_, bytes)| *bytes == 4096));
+
+        // Older manifests have no such field; they must still deserialize.
+        let json = serde_json::json!({
+            "version": MANIFEST_VERSION,
+            "id": "m-old",
+            "created": "2026-01-01T00:00:00.000Z",
+            "trigger": "manual",
+            "objects": {}
+        });
+        let old: Manifest = serde_json::from_value(json).unwrap();
+        assert!(old.objects.tombstones.is_none());
     }
 }

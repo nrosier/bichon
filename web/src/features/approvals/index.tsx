@@ -31,6 +31,7 @@ import {
   break_glass_request,
   is_outcome_item,
   list_approvals,
+  OP_GDPR_ERASURE,
   reject_request,
   type ApprovalRequest,
   type ApprovalResultItem,
@@ -113,6 +114,16 @@ function describe_result_item(item: ApprovalResultItem): string {
         return `account #${item.account_id}: ${item.error ?? 'unknown'}`
       case 'token':
         return `${item.username || `#${item.user_id}`}: ${item.error ?? 'unknown'}`
+      case 'export':
+        return `${item.saved_search_name || item.export_id || 'export'}: ${
+          item.error ?? 'unknown'
+        }`
+      case 'erasure':
+        return `${item.subject || `#${item.account_id}`}: ${
+          item.error ?? 'unknown'
+        }`
+      case 'retention':
+        return `account #${item.account_id}: ${item.error ?? 'unknown'}`
     }
   }
   return `${item.email || `#${item.account_id}`}: ${item.error ?? 'unknown'}`
@@ -130,7 +141,14 @@ export default function ApprovalsPage() {
   // A compliance officer without `approval:decide` may still read the queue:
   // the separation-of-duties permission grants sight of it, never the power to
   // move it.
-  const canView = require_any_permission(['approval:decide', 'compliance:audit'])
+  const canView = require_any_permission([
+    'approval:decide',
+    'compliance:audit',
+    // The built-in administrator holds system:root, and both the sidebar and
+    // the server's read gate accept it. Omitting it here showed the admin the
+    // entry and then rendered the forbidden state on the page.
+    'system:root',
+  ])
   const canDecide = require_any_permission(['approval:decide'])
   // The break-glass override is narrower than deciding: the server requires
   // `system:root` for it, and only a root admin may waive the second
@@ -492,7 +510,12 @@ export default function ApprovalsPage() {
           )}
           <div className='space-y-2'>
             <Label className='text-xs'>
-              {t('approvals.approveNote', 'Note (optional)')}
+              {approving?.op === OP_GDPR_ERASURE
+                ? t(
+                    'approvals.approveNoteRequired',
+                    'Note (required — state the basis)'
+                  )
+                : t('approvals.approveNote', 'Note (optional)')}
             </Label>
             <Textarea
               value={note}
@@ -503,11 +526,25 @@ export default function ApprovalsPage() {
               )}
               rows={2}
             />
+            {/* The server refuses an unexplained erasure decision. Saying so
+                here is the difference between "the button is broken" and "I
+                have to write down why". */}
+            {approving?.op === OP_GDPR_ERASURE && (
+              <p className='text-xs text-muted-foreground'>
+                {t(
+                  'approvals.approveNoteRequiredHint',
+                  'This is recorded as the basis on which the erasure is lawful. It cannot be left empty.'
+                )}
+              </p>
+            )}
           </div>
           <AlertDialogFooter>
             <AlertDialogCancel>{t('common.cancel')}</AlertDialogCancel>
             <AlertDialogAction
-              disabled={approveMutation.isPending}
+              disabled={
+                approveMutation.isPending ||
+                (approving?.op === OP_GDPR_ERASURE && !note.trim())
+              }
               onClick={() =>
                 approving &&
                 approveMutation.mutate({
@@ -603,10 +640,15 @@ export default function ApprovalsPage() {
           )}
           <div className='space-y-2'>
             <Label className='text-xs'>
-              {t(
-                'approvals.breakGlassNote',
-                'Reason (optional, but recorded)'
-              )}
+              {breakingGlass?.op === OP_GDPR_ERASURE
+                ? t(
+                    'approvals.approveNoteRequired',
+                    'Note (required — state the basis)'
+                  )
+                : t(
+                    'approvals.breakGlassNote',
+                    'Reason (optional, but recorded)'
+                  )}
             </Label>
             <Textarea
               value={note}
@@ -622,7 +664,10 @@ export default function ApprovalsPage() {
             <AlertDialogCancel>{t('common.cancel')}</AlertDialogCancel>
             <AlertDialogAction
               className='bg-destructive text-destructive-foreground'
-              disabled={breakGlassMutation.isPending}
+              disabled={
+                breakGlassMutation.isPending ||
+                (breakingGlass?.op === OP_GDPR_ERASURE && !note.trim())
+              }
               onClick={() =>
                 breakingGlass &&
                 breakGlassMutation.mutate({

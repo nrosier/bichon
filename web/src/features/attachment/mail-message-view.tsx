@@ -25,7 +25,7 @@ import { Button } from '@/components/ui/button';
 import { Separator } from '@/components/ui/separator';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { toast } from '@/hooks/use-toast';
-import { formatBytes } from '@/lib/utils';
+import { formatBytes, formatSender } from '@/lib/utils';
 import EmailIframe from '@/components/mail-iframe';
 import {
   AttachmentInfo,
@@ -113,7 +113,7 @@ export function MailMessageView({
   showHeader = true
 }: MailMessageViewProps) {
   const { t } = useTranslation()
-  const { setToDelete, setOpen, setSelected } = useAttachmentContext();
+  const { setToDelete, setOpen } = useAttachmentContext();
   const [content, setContent] = useState<string | null>(null);
   const [contentType, setContentType] = useState<'Plain' | 'Html' | null>(null);
   const [attachments, setAttachments] = useState<AttachmentInfo[] | null>(null);
@@ -238,7 +238,10 @@ export function MailMessageView({
         {envelope.from && (
           <div className="flex space-x-2">
             <span className="font-medium text-gray-400">{t('mail.from')}:</span>
-            <span>{envelope.from}</span>
+            <span title={envelope.wire_from ? `via ${envelope.wire_from}` : undefined}>{formatSender(envelope.from_name, envelope.from)}</span>
+            {envelope.wire_from && (
+              <span className="text-gray-400 text-xs">via {envelope.wire_from}</span>
+            )}
           </div>
         )}
         {envelope.to && envelope.to.length > 0 && <Multilines title={t('mail.to')} lines={envelope.to} />}
@@ -301,7 +304,6 @@ export function MailMessageView({
                   variant="ghost"
                   size="icon"
                   onClick={() => {
-                    setSelected(new Map())
                     setOpen('restore')
                   }}
                 >
@@ -320,7 +322,13 @@ export function MailMessageView({
             <span className="text-gray-500 text-xs" />
           ) : attachments && attachments.length > 0 ? (
             (() => {
-              const nonInline = attachments.filter((a) => !a.inline);
+              // Only parts rendered in the body (a cid: reference) are hidden.
+              // A bare `Content-Disposition: inline` does not make a part body
+              // content — Apple Mail attaches PDFs that way — but older servers
+              // still report it as `inline` with no content_id (#404).
+              const nonInline = attachments.filter(
+                (a) => !(a.inline && a.content_id)
+              );
 
               return nonInline.length > 0 ? (
                 <div className="space-y-2">

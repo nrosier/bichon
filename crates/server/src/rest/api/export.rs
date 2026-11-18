@@ -17,6 +17,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use crate::common::auth::WrappedContext;
+use bichon_core::common::auth::ClientContext;
 use crate::export::{
     cancel_export, create_download_ticket, create_export, delete_export, download_artifact,
     get_export, list_exports, preview, resolve_download_ticket,
@@ -29,7 +30,6 @@ use bichon_core::export::{
 };
 use bichon_core::ext::event_bus::{emit, Event};
 use bichon_core::raise_error;
-use bichon_core::users::permissions::Permission;
 use poem::{handler, Body, IntoResponse, Response};
 use poem_openapi::param::Path;
 use poem_openapi::payload::{Attachment, AttachmentType, Json};
@@ -59,7 +59,12 @@ impl ExportApi {
         payload: Json<ExportPreviewRequest>,
     ) -> ApiResult<Json<ExportPreviewView>> {
         let scope = export_scope(&context)?;
-        let view = preview(context.user.id, &payload.0.saved_search_id, scope)?;
+        let view = preview(
+            context.user.id,
+            &payload.0.source(),
+            payload.0.format.unwrap_or_default(),
+            scope,
+        )?;
         Ok(Json(view))
     }
 
@@ -78,7 +83,7 @@ impl ExportApi {
         let job = create_export(
             context.user.id,
             context.user.username.clone(),
-            &payload.0.saved_search_id,
+            &payload.0.source(),
             payload.0.format.unwrap_or_default(),
             scope,
         )?;
@@ -140,7 +145,8 @@ impl ExportApi {
         Ok(delete_export(context.user.id, &job_id.0)?)
     }
 
-    /// Downloads the finished mbox artifact.
+    /// Downloads the finished export artifact (mbox for whole-message
+    /// exports, zip for attachment exports).
     #[oai(
         path = "/exports/:job_id/download",
         method = "get",
@@ -245,26 +251,21 @@ pub async fn download_export_ticket_handler(
 /// caller holds the global `data:export:batch` permission (or is an admin),
 /// otherwise the subset of their accessible accounts whose role grants
 /// `data:export:batch`. Returns `Forbidden` when nothing is exportable.
-fn export_scope(
-    context: &WrappedContext,
+///
+/// The resolution lives in `bichon_core::account::access` beside the search
+/// scope, so "what may this caller read" has one implementation and an export
+/// cannot disagree with a search about it — including the view handling: a
+/// view contributes its **unfiltered** sources, and a caller whose only grant
+/// is a filtered view is refused with that reason (the export engine and the
+/// approval record both carry account ids, which cannot express the filter).
+///
+/// Public, and over `ClientContext` rather than the `WrappedContext` extractor,
+/// because the Pro dual-control gate has to resolve the same scope *before* the
+/// handler runs — it queues the request instead of letting it through, so this
+/// is the only copy of the check that executes on the gated path. Duplicating
+/// it there would be a second security decision to keep in step with this one.
+pub fn export_scope(
+    context: &ClientContext,
 ) -> bichon_core::error::BichonResult<Option<HashSet<u64>>> {
-    if context.has_permission(None, Permission::DATA_EXPORT_BATCH) {
-        return Ok(None);
-    }
-    let scoped: HashSet<u64> = context
-        .user
-        .account_access_map
-        .keys()
-        .cloned()
-        .filter(|account_id| {
-            context.has_permission(Some(*account_id), Permission::DATA_EXPORT_BATCH)
-        })
-        .collect();
-    if scoped.is_empty() {
-        return Err(raise_error!(
-            "Access Denied: Missing permission 'data:export:batch'".into(),
-            ErrorCode::Forbidden
-        ));
-    }
-    Ok(Some(scoped))
+    bichon_core::account::access::export_scope_accounts(context)
 }

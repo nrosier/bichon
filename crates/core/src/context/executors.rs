@@ -41,6 +41,10 @@ impl Initialize for BichonContext {
         // community and Pro servers initialize through this hook, so the
         // scheduler starts exactly once per process.
         crate::retention::start_retention_scheduler();
+        // Batch deletions are asynchronous and persisted; a job that was
+        // running when the process stopped must not look like it is still
+        // progressing. It is never resumed automatically.
+        crate::message::batch_delete::interrupt_running_jobs()?;
         // Built-in backup subsystem (community preparers + scheduler). The Pro
         // binary registers its own preparers *before* this hook runs, so
         // `register_base_preparers` plus the Pro additions are all in place
@@ -110,6 +114,24 @@ impl BichonContext {
                 Err(e) => {
                     warn!(
                         "Failed to finalize stale gap-fill run for account {}: {:#?}",
+                        account.id, e
+                    );
+                }
+                Ok(false) => {}
+            }
+            // Same for a cleanup run interrupted by a crash. It must not show
+            // as Running forever, and the next scheduled slot has to be able
+            // to start.
+            match crate::account::state::RemoteCleanupState::finalize_stale_run(account.id) {
+                Ok(true) => {
+                    info!(
+                        "Account {}: stale remote-cleanup run finalized on startup.",
+                        account.id
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to finalize stale remote-cleanup run for account {}: {:#?}",
                         account.id, e
                     );
                 }

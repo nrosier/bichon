@@ -101,17 +101,59 @@ export interface DownloadTicketView {
   url: string;
 }
 
-export const previewExport = async (savedSearchId: string) => {
-  const response = await axiosInstance.post<ExportPreviewView>("api/v1/exports/preview", {
-    saved_search_id: savedSearchId,
-  });
+/** Wire values of `bichon_core::export::ExportFormat` (variant names, not
+ *  the lowercase `as_str` labels used in audit/approval rows). */
+export type ExportFormatValue = "Mbox" | "Attachments";
+
+/** An ad-hoc export selection, built from the page's current filter. Which
+ *  half is used is decided by `format`; the other must be left unset. */
+export interface ExportFilter {
+  email?: Record<string, unknown>;
+  attachment?: Record<string, unknown>;
+}
+
+/** What to export: a saved search or an ad-hoc filter, plus the format.
+ *  Exactly one of `saved_search_id` and `filter` is set. */
+export interface ExportRequest {
+  saved_search_id?: string;
+  filter?: ExportFilter;
+  /** Display name for an ad-hoc export in the job list / approval card. */
+  label?: string;
+  format?: ExportFormatValue;
+}
+
+export const previewExport = async (request: ExportRequest) => {
+  const response = await axiosInstance.post<ExportPreviewView>(
+    "api/v1/exports/preview",
+    request
+  );
   return response.data;
 };
 
-export const createExport = async (savedSearchId: string) => {
-  const response = await axiosInstance.post<ExportJobView>("api/v1/exports", {
-    saved_search_id: savedSearchId,
-  });
+/** A queued acknowledgement, returned instead of a job when dual control is on
+ *  for `export.batch`. Nothing has been exported — `pending` is the
+ *  discriminator, because the ungated path never sets it. */
+export interface QueuedExport {
+  ok: false;
+  pending: true;
+  request_id: string;
+  expires_at?: number | null;
+}
+
+/** What starting an export returns: a job, or the queued acknowledgement. */
+export type ExportStartResult = ExportJobView | QueuedExport;
+
+export const is_queued_export = (
+  result: ExportStartResult
+): result is QueuedExport => (result as QueuedExport).pending === true;
+
+export const createExport = async (
+  request: ExportRequest
+): Promise<ExportStartResult> => {
+  const response = await axiosInstance.post<ExportStartResult>(
+    "api/v1/exports",
+    request
+  );
   return response.data;
 };
 

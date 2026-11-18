@@ -33,6 +33,23 @@ pub mod totp;
 pub mod shutdown;
 pub mod tls;
 
+/// Collapse every run of whitespace to a single space.
+///
+/// Equivalent to `text.split_whitespace().collect::<Vec<_>>().join(" ")`
+/// without the intermediate vector: on a large HTML body that vector costs
+/// several bytes per word — comparable to the text itself — and exists only
+/// long enough to be joined.
+pub fn normalize_whitespace(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for word in text.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    out
+}
+
 #[macro_export]
 macro_rules! bichon_version {
     () => {
@@ -351,6 +368,13 @@ pub fn decode_avatar_bytes(base64_str: &str) -> BichonResult<Vec<u8>> {
 pub fn compute_content_hash(content: &[u8]) -> String {
     let hash = blake3::hash(content);
     hash.to_hex().to_string()
+}
+
+/// Isolate raw MIME blobs from legacy decoded attachment and original EML keys.
+pub fn compute_raw_attachment_hash(content: &[u8]) -> String {
+    let mut hasher = blake3::Hasher::new_derive_key("bichon.raw-mime-attachment.v1");
+    hasher.update(content);
+    hasher.finalize().to_hex().to_string()
 }
 
 #[cfg(test)]

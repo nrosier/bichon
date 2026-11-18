@@ -37,6 +37,7 @@ import { Main } from '@/components/layout/main'
 import { useEdition } from '@/hooks/use-edition'
 import { useCurrentUser } from '@/hooks/use-current-user'
 import { useToast } from '@/hooks/use-toast'
+import { copyToClipboard } from '@/lib/clipboard'
 import {
   get_license_status,
   upload_license,
@@ -86,6 +87,10 @@ export default function LicensePage() {
       toast({ title: t('license.uploadSuccess') })
       setLicenseText('')
       queryClient.invalidateQueries({ queryKey: ['license-status'] })
+      // The sidebar and every edition gate read `/features` (cached for the
+      // life of the page). Without this, Enterprise items — LDAP, SIEM,
+      // compliance — stay hidden until a full reload after an upgrade.
+      queryClient.invalidateQueries({ queryKey: ['edition'] })
     },
     onError: (err: AxiosError<{ error?: string }>) => {
       toast({
@@ -99,7 +104,7 @@ export default function LicensePage() {
   const copyMachineId = async () => {
     if (!data?.machine_id) return
     try {
-      await navigator.clipboard.writeText(data.machine_id)
+      await copyToClipboard(data.machine_id)
       toast({ title: t('license.copied') })
     } catch {
       toast({ title: t('license.copyFailed'), variant: 'destructive' })

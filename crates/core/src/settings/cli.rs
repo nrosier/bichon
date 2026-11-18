@@ -17,7 +17,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use crate::settings::io::check_dir_read_write;
-use clap::{builder::ValueParser, Args, Parser, ValueEnum};
+use clap::{builder::ValueParser, Args, CommandFactory, FromArgMatches, Parser, ValueEnum};
 use std::{
     collections::HashSet,
     env, fmt,
@@ -376,14 +376,16 @@ pub struct Settings {
 /// Arguments for the one-shot disaster-recovery restore (`bichon-admin
 /// restore`). Restore lives in the admin tool, not the server binary: a
 /// fresh box has no data root yet, and the server CLI requires one at the
-/// clap level. The S3 backend connection details come from a JSON config
+/// clap level. The backend connection details come from a JSON config
 /// file (`--config`) — restore deliberately does not read the local
 /// install's metadata store, so it runs unchanged on a fresh box.
 #[derive(Clone, Debug, Args)]
 pub struct RestoreArgs {
-    /// JSON config file with the S3 backup backend settings (`s3_endpoint`,
-    /// `s3_bucket`, `prefix`, `s3_region`, `s3_access_key`,
-    /// `s3_secret_key`; only endpoint and bucket are mandatory).
+    /// JSON config file with the backup backend settings. For an S3 target:
+    /// `s3_endpoint`, `s3_bucket` (both mandatory), `prefix`, `s3_region`,
+    /// `s3_access_key`, `s3_secret_key`. For a local target:
+    /// `"target_type": "local"` plus a mandatory `local_dir`. `prefix` and
+    /// `target_type` are optional; `target_type` defaults to `s3`.
     #[clap(
         long,
         short = 'c',
@@ -395,7 +397,7 @@ pub struct RestoreArgs {
             }
             Ok(s.to_string())
         }),
-        help = "JSON config file with the S3 backup backend settings (s3_endpoint, s3_bucket, prefix, s3_region, s3_access_key, s3_secret_key)"
+        help = "JSON config file with the backup backend settings (s3: s3_endpoint, s3_bucket, prefix, s3_region, s3_access_key, s3_secret_key; local: target_type, local_dir)"
     )]
     pub config: String,
 
@@ -503,22 +505,9 @@ impl Settings {
                 // only the binary name so that the settings come entirely
                 // from environment variables.
                 let args: Vec<String> = std::env::args().collect();
-                match Self::try_parse_from(&args) {
+                match parse_settings_from(Settings::command(), args) {
                     Ok(s) => s,
-                    Err(e) => {
-                        // `--help` / `--version` short-circuit clap; print and
-                        // exit cleanly instead of falling through to the
-                        // env-only re-parse (which would then trip the
-                        // data-root requirement below on a server run).
-                        if matches!(
-                            e.kind(),
-                            clap::error::ErrorKind::DisplayHelp
-                                | clap::error::ErrorKind::DisplayVersion
-                        ) {
-                            e.exit();
-                        }
-                        Self::parse_from(std::iter::once(args[0].clone()))
-                    }
+                    Err(e) => e.exit(),
                 }
             }
         };
@@ -530,6 +519,38 @@ impl Settings {
             );
         }
         s
+    }
+}
+
+/// Parses the process arguments, keeping the env-only fallback for test
+/// binaries without letting it hide a real invocation error.
+///
+/// The fallback exists because `cargo test` appends filter names and harness
+/// flags that the server flags do not accept. A real server run with a typo
+/// (`--bichon-smtp-enable`) also fails the direct parse, and the env-only
+/// retry then fails on the required `--bichon-root-dir` — reporting *that*
+/// would tell the operator the opposite of what happened. When both parses
+/// fail, the original error is the truthful one.
+fn parse_settings_from(command: clap::Command, args: Vec<String>) -> Result<Settings, clap::Error> {
+    match command.clone().try_get_matches_from(&args) {
+        Ok(matches) => Settings::from_arg_matches(&matches),
+        Err(first) => match first.kind() {
+            // `--help` / `--version` are successful short-circuits, not
+            // failures; let clap print and exit.
+            clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {
+                Err(first)
+            }
+            _ => {
+                let binary = args
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "bichon".to_string());
+                match command.try_get_matches_from([binary]) {
+                    Ok(matches) => Settings::from_arg_matches(&matches),
+                    Err(_) => Err(first),
+                }
+            }
+        },
     }
 }
 
@@ -614,20 +635,54 @@ mod tests {
 
     /// A server run without `--bichon-root-dir` must fail at the clap level —
     /// the requirement is enforced by the parser, not by a manual runtime
-    /// check. The env binding is lifted for the parse (other tests in this
-    /// binary legitimately set `BICHON_ROOT_DIR` to bootstrap `SETTINGS`) and
-    /// restored afterwards.
+    /// check.
+    ///
+    /// The parse is run with the env binding lifted, so the assertion is about
+    /// the *flag* being required and does not depend on the process
+    /// environment. Several test modules bootstrap `SETTINGS` by setting
+    /// `BICHON_ROOT_DIR` concurrently; clearing it here to make the parse
+    /// meaningful raced with those writes and flaked.
     #[test]
     fn server_run_without_root_dir_is_clap_error() {
-        let saved = std::env::var("BICHON_ROOT_DIR").ok();
-        std::env::remove_var("BICHON_ROOT_DIR");
-        let parsed = Settings::try_parse_from(["bichon", "--bichon-http-port", "9999"]);
-        match saved {
-            Some(v) => std::env::set_var("BICHON_ROOT_DIR", v),
-            None => std::env::remove_var("BICHON_ROOT_DIR"),
-        }
+        use clap::builder::Resettable;
+        use clap::CommandFactory;
+
+        let parsed = Settings::command()
+            .mut_arg("bichon_root_dir", |arg| arg.env(Resettable::Reset))
+            .try_get_matches_from(["bichon", "--bichon-http-port", "9999"]);
         let err = parsed.expect_err("missing --bichon-root-dir must be rejected");
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    /// A typo'd flag must be reported as such. The env-only retry used for
+    /// `cargo test` harness args used to replace this with "missing
+    /// --bichon-root-dir", which made a wrong flag look like a missing value
+    /// for an argument the operator had in fact provided.
+    #[test]
+    fn typo_flag_reports_the_real_error_not_a_missing_root_dir() {
+        use clap::builder::Resettable;
+
+        let root = std::env::temp_dir().join("bichon-cli-typo-test-root");
+        let command = Settings::command()
+            .mut_arg("bichon_root_dir", |arg| arg.env(Resettable::Reset));
+        let err = parse_settings_from(
+            command,
+            [
+                "bichon",
+                "--bichon-root-dir",
+                root.to_str().unwrap(),
+                "--bichon-smtp-enable",
+            ]
+            .map(String::from)
+            .to_vec(),
+        )
+        .expect_err("unknown flag must be rejected");
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+        assert!(
+            err.to_string().contains("--bichon-smtp-enable"),
+            "the error must name the flag the operator typed: {err}"
+        );
     }
 
     /// `RestoreArgs` (the `bichon-admin restore` flags) parse standalone:
@@ -635,6 +690,7 @@ mod tests {
     /// config file.
     #[test]
     fn restore_args_parse_standalone() {
+        use clap::builder::Resettable;
         use clap::{Command as ClapCommand, FromArgMatches};
 
         let cfg = std::env::temp_dir().join("bichon-restore-cfg-test.json");
@@ -644,7 +700,15 @@ mod tests {
         )
         .unwrap();
 
-        let matches = RestoreArgs::augment_args(ClapCommand::new("restore"))
+        // The env binding is lifted so `root_dir` is None deterministically:
+        // other test modules set `BICHON_ROOT_DIR` concurrently to bootstrap
+        // `SETTINGS`, which made this assertion depend on timing.
+        let restore_command = || {
+            RestoreArgs::augment_args(ClapCommand::new("restore"))
+                .mut_arg("root_dir", |arg| arg.env(Resettable::Reset))
+        };
+
+        let matches = restore_command()
             .try_get_matches_from([
                 "restore",
                 "--config",
@@ -656,20 +720,16 @@ mod tests {
         let args = RestoreArgs::from_arg_matches(&matches).unwrap();
         assert_eq!(args.into, "/tmp/restore");
         assert!(args.point.is_none());
-        // `root_dir` binds `BICHON_ROOT_DIR`; other tests in this binary set
-        // that env concurrently, so only assert absence on a clean env.
-        if std::env::var("BICHON_ROOT_DIR").is_err() {
-            assert!(args.root_dir.is_none());
-        }
+        assert!(args.root_dir.is_none());
 
         // `--config` and `--into` are required; a missing file is rejected by
         // the value parser.
-        let err = RestoreArgs::augment_args(ClapCommand::new("restore"))
+        let err = restore_command()
             .try_get_matches_from(["restore", "--into", "/tmp/restore"])
             .expect_err("missing --config must be rejected");
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
 
-        let err = RestoreArgs::augment_args(ClapCommand::new("restore"))
+        let err = restore_command()
             .try_get_matches_from([
                 "restore",
                 "--config",

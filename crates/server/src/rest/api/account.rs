@@ -23,22 +23,31 @@ use bichon_core::account::grant::BatchAccountRoleRequest;
 use bichon_core::account::migration::{AccountModel, AccountType};
 use bichon_core::account::payload::{
     filter_accessible_accounts, AccountCreateRequest, AccountUpdateRequest, MinimalAccount,
+    RetentionPolicyRequest,
 };
-use bichon_core::account::state::{DownloadState, GapFillState};
+use bichon_core::account::state::{DownloadState, GapFillState, RemoteCleanupState};
+use bichon_core::archive::imap::cleanup::{
+    account_jobs, cancel_job, get_job, start_move_preview, start_move_run, CleanupJob, MoveRequest,
+};
 use bichon_core::account::stats::AccountStats;
 use bichon_core::account::view::AccountResp;
 use bichon_core::archive::imap::task::SYNC_TASKS;
 use bichon_core::common::paginated::{paginate_vec, DataPage};
 use bichon_core::error::code::ErrorCode;
 use bichon_core::ext::event_bus::{emit, Event};
+use bichon_core::ext::retention_policy::{
+    gate_weakening_change, min_retention_allowed, RetentionChange, RetentionGateDecision,
+    RetentionValues,
+};
 use bichon_core::raise_error;
 use bichon_core::store::tantivy::envelope::ENVELOPE_MANAGER;
 use bichon_core::users::permissions::Permission;
 use bichon_core::users::UserModel;
 use poem_openapi::param::{Path, Query};
-use poem_openapi::payload::Json;
+use poem_openapi::payload::{Json, Response as OaiResponse};
 use poem_openapi::OpenApi;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
 pub struct AccountApi;
@@ -52,6 +61,17 @@ pub struct StartDownloadRequest {
     /// sync. Defaults to false; omitted by older clients.
     #[serde(default)]
     pub run_gap_fill: bool,
+}
+
+/// Confirmation body for a manual cleanup move.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, poem_openapi::Object)]
+pub struct RemoteCleanupExecuteRequest {
+    /// Token returned by the move preview.
+    pub preview_token: String,
+    /// Must be true.
+    pub confirm: bool,
+    /// Must be true; the source copy leaves the mailbox.
+    pub acknowledge_risk: bool,
 }
 
 #[OpenApi(prefix_path = "/api/v1", tag = "ApiTags::Account")]
@@ -108,12 +128,39 @@ impl AccountApi {
         context: WrappedContext,
     ) -> ApiResult<Json<AccountModel>> {
         context.require_permission(None, Permission::ACCOUNT_CREATE)?;
-        let account = AccountModel::create_account(context.user.id, payload.0).await?;
+        // Retention is a compliance control, not an ordinary account setting:
+        // only a system root may create an account with a non-zero window or
+        // lock. The minimum lock is additionally Enterprise-only.
+        let min_days = payload.0.min_retention_days.unwrap_or(0);
+        if payload.0.retention_days.unwrap_or(0) > 0 || min_days > 0 {
+            context.require_permission(None, Permission::ROOT)?;
+        }
+        if min_days > 0 && !min_retention_allowed() {
+            return Err(raise_error!(
+                "The minimum-retention lock requires an Enterprise license".to_string(),
+                ErrorCode::Forbidden
+            )
+            .into());
+        }
+        // The view rule (a view delegates read access, so every source needs
+        // `account:manage`) is enforced inside `create_account`, where a second
+        // caller cannot skip it.
+        let account = AccountModel::create_account(context.user.id, payload.0, &context).await?;
         emit(Event::AccountCreated {
             created_by: context.user.username.clone(),
             account_id: account.id,
             email: account.email.clone(),
         });
+        if account.retention_days.is_some() || account.min_retention_days.is_some() {
+            emit(Event::RetentionPolicyChanged {
+                user: context.user.username.clone(),
+                account_id: account.id,
+                retention_days_before: None,
+                retention_days_after: account.retention_days,
+                min_retention_days_before: None,
+                min_retention_days_after: account.min_retention_days,
+            });
+        }
         Ok(Json(account))
     }
 
@@ -133,16 +180,148 @@ impl AccountApi {
     ) -> ApiResult<()> {
         let account_id = account_id.0;
         context.require_permission(Some(account_id), Permission::ACCOUNT_MANAGE)?;
-        AccountModel::update(account_id, payload.0, true)?;
-        let email = AccountModel::find(account_id)?
-            .map(|a| a.email)
+        // Retention is changed through the dedicated endpoint: a weakening
+        // change may need a second signature, and this handler has no way to
+        // freeze only the two retention fields out of an arbitrary account
+        // update.
+        if payload.0.retention_days.is_some()
+            || payload.0.clear_retention_days == Some(true)
+            || payload.0.min_retention_days.is_some()
+            || payload.0.clear_min_retention_days == Some(true)
+        {
+            return Err(raise_error!(
+                "Retention fields are changed via POST /api/v1/account/:account_id/retention"
+                    .to_string(),
+                ErrorCode::InvalidParameter
+            )
+            .into());
+        }
+        // Read the scope *before* the write: the audit record has to say what
+        // the view looked like beforehand, and after the update that value is
+        // gone. `AccountModel::update` enforces the source-management rule
+        // (editing a view can widen it), so a second caller cannot skip it.
+        let before = AccountModel::get(account_id)?;
+        let before_view = before.view.clone();
+        AccountModel::update(account_id, payload.0, &context)?;
+        let updated = AccountModel::find(account_id)?;
+        let email = updated
+            .as_ref()
+            .map(|a| a.email.clone())
             .unwrap_or_else(|| format!("account-{account_id}"));
         emit(Event::AccountUpdated {
             updated_by: context.user.username.clone(),
             account_id,
             email,
+            view_change: bichon_core::account::migration::ViewConfigChange::between(
+                before_view.as_ref(),
+                updated.as_ref().and_then(|a| a.view.as_ref()),
+            ),
         });
+        if let Some(after) = updated.as_ref() {
+            if before.retention_days != after.retention_days
+                || before.min_retention_days != after.min_retention_days
+            {
+                emit(Event::RetentionPolicyChanged {
+                    user: context.user.username.clone(),
+                    account_id,
+                    retention_days_before: before.retention_days,
+                    retention_days_after: after.retention_days,
+                    min_retention_days_before: before.min_retention_days,
+                    min_retention_days_after: after.min_retention_days,
+                });
+            }
+        }
         Ok(())
+    }
+
+    /// Change an account's retention policy.
+    ///
+    /// Root-only. A change that weakens protection (shorter maximum retention,
+    /// or a shorter/removed minimum-retention lock) may be queued as a
+    /// dual-control request; a strengthening change always applies directly.
+    /// The retention fields are rejected by the general account-update
+    /// endpoint so this is the only path that can alter them.
+    #[oai(
+        path = "/account/:account_id/retention",
+        method = "post",
+        operation_id = "update_account_retention"
+    )]
+    async fn update_account_retention(
+        &self,
+        account_id: Path<u64>,
+        payload: Json<RetentionPolicyRequest>,
+        context: WrappedContext,
+    ) -> ApiResult<OaiResponse<Json<Value>>> {
+        let account_id = account_id.0;
+        context.require_permission(None, Permission::ROOT)?;
+        let before = AccountModel::get(account_id)?;
+        let before_values = RetentionValues {
+            retention_days: before.retention_days.filter(|days| *days > 0),
+            min_retention_days: before.min_retention_days.filter(|days| *days > 0),
+        };
+        let (retention_days, min_retention_days) = payload
+            .0
+            .resolve(before_values.retention_days, before_values.min_retention_days)?;
+
+        // The lock is Enterprise-only. Unchanged values are allowed on a
+        // lapsed licence so operators can still edit other settings.
+        if min_retention_days != before_values.min_retention_days
+            && !min_retention_allowed()
+        {
+            return Err(raise_error!(
+                "The minimum-retention lock requires an Enterprise license".to_string(),
+                ErrorCode::Forbidden
+            )
+            .into());
+        }
+
+        let change = RetentionChange {
+            account_id,
+            before: before_values,
+            after: RetentionValues {
+                retention_days,
+                min_retention_days,
+            },
+        };
+        let decision = if change.is_weakening() {
+            gate_weakening_change(
+                &change,
+                context.user.id,
+                &context.user.username,
+                context.user.is_admin(),
+            )?
+        } else {
+            RetentionGateDecision::Execute
+        };
+
+        match decision {
+            RetentionGateDecision::Queued {
+                request_id,
+                expires_at,
+            } => Ok(OaiResponse::new(Json(serde_json::json!({
+                "ok": false,
+                "pending": true,
+                "account_id": account_id,
+                "request_id": request_id,
+                "expires_at": expires_at,
+            })))
+            .status(http::StatusCode::ACCEPTED)),
+            RetentionGateDecision::Execute => {
+                let updated = AccountModel::apply_retention_policy(
+                    account_id,
+                    retention_days,
+                    min_retention_days,
+                    &context.user.username,
+                )?;
+                Ok(OaiResponse::new(Json(serde_json::json!({
+                    "ok": true,
+                    "pending": false,
+                    "account_id": account_id,
+                    "retention_days": updated.retention_days,
+                    "min_retention_days": updated.min_retention_days,
+                }))))
+            }
+        }
     }
 
     /// List accounts with optional pagination parameters
@@ -253,6 +432,163 @@ impl AccountApi {
             history: Vec::new(),
         });
         Ok(Json(state))
+    }
+
+    /// Get the source-mailbox cleanup state of an account
+    #[oai(
+        path = "/accounts/:account_id/remote-cleanup/state",
+        method = "get",
+        operation_id = "accounts_remote_cleanup_state"
+    )]
+    async fn accounts_remote_cleanup_state(
+        &self,
+        /// The account ID to check cleanup state for
+        account_id: Path<u64>,
+        context: WrappedContext,
+    ) -> ApiResult<Json<RemoteCleanupState>> {
+        let account_id = account_id.0;
+        AccountModel::check_account_exists(account_id)?;
+        context.require_permission(Some(account_id), Permission::ACCOUNT_READ_DETAILS)?;
+        let state = RemoteCleanupState::get(account_id)?.unwrap_or(RemoteCleanupState {
+            account_id,
+            ..Default::default()
+        });
+        Ok(Json(state))
+    }
+
+    /// Starts a read-only move preview as a background job.
+    ///
+    /// Verifying every candidate takes several IMAP round trips per message,
+    /// so the preview can outlive an HTTP request. The response is the job
+    /// immediately; poll `GET /accounts/:account_id/remote-cleanup/jobs/:job_id`
+    /// for the result and `POST .../cancel` to stop it.
+    #[oai(
+        path = "/accounts/:account_id/remote-cleanup/preview",
+        method = "post",
+        operation_id = "accounts_remote_cleanup_preview"
+    )]
+    async fn accounts_remote_cleanup_preview(
+        &self,
+        /// The account ID to preview cleanup for
+        account_id: Path<u64>,
+        context: WrappedContext,
+    ) -> ApiResult<Json<CleanupJob>> {
+        let account_id = account_id.0;
+        let account = AccountModel::check_account_exists(account_id)?;
+        context.require_permission(Some(account_id), Permission::ACCOUNT_MANAGE)?;
+        if !matches!(account.account_type, AccountType::IMAP) {
+            return Err(raise_error!(
+                "Source-mailbox cleanup is only supported for IMAP accounts".into(),
+                ErrorCode::InvalidParameter
+            ))?;
+        }
+        Ok(Json(start_move_preview(
+            account,
+            context.user.username.clone(),
+        )?))
+    }
+
+    /// Starts a previewed move into bichon_auto_created_trash as a background
+    /// job. The preview token is still validated by the worker.
+    #[oai(
+        path = "/accounts/:account_id/remote-cleanup/execute",
+        method = "post",
+        operation_id = "accounts_remote_cleanup_execute"
+    )]
+    async fn accounts_remote_cleanup_execute(
+        &self,
+        /// The account ID to run cleanup for
+        account_id: Path<u64>,
+        body: Json<RemoteCleanupExecuteRequest>,
+        context: WrappedContext,
+    ) -> ApiResult<Json<CleanupJob>> {
+        let account_id = account_id.0;
+        let account = AccountModel::check_account_exists(account_id)?;
+        context.require_permission(Some(account_id), Permission::ACCOUNT_MANAGE)?;
+        if !body.confirm || !body.acknowledge_risk {
+            return Err(raise_error!(
+                "cleanup execution requires confirm=true and acknowledge_risk=true".into(),
+                ErrorCode::InvalidParameter
+            ))?;
+        }
+        Ok(Json(start_move_run(
+            account,
+            MoveRequest::manual(context.user.username.clone(), body.preview_token.clone()),
+        )?))
+    }
+
+    /// List the cleanup jobs still known for an account, newest first.
+    ///
+    /// Jobs live in memory and stay readable for `JOB_TTL_MS` after finishing.
+    /// A client that lost its job id (page reload, dialog reopened) uses this
+    /// to reattach to a running job or show its finished report instead of
+    /// starting a second one, which the server refuses.
+    #[oai(
+        path = "/accounts/:account_id/remote-cleanup/jobs",
+        method = "get",
+        operation_id = "accounts_remote_cleanup_jobs"
+    )]
+    async fn accounts_remote_cleanup_jobs(
+        &self,
+        /// The account to list cleanup jobs for
+        account_id: Path<u64>,
+        context: WrappedContext,
+    ) -> ApiResult<Json<Vec<CleanupJob>>> {
+        let account_id = account_id.0;
+        AccountModel::check_account_exists(account_id)?;
+        // A cleanup job can move mail, so its result is not merely account
+        // metadata; the same permission that guards reading a single job.
+        context.require_permission(Some(account_id), Permission::ACCOUNT_MANAGE)?;
+        Ok(Json(account_jobs(account_id)))
+    }
+
+    /// Poll a running or recently finished cleanup job.
+    ///
+    /// `status` is `Running` until the worker ends; a finished job keeps its
+    /// result (`preview` or `run`) readable for a while, so a client
+    /// that lost the connection can still pick it up. `error` explains a
+    /// `Failed` job and a stop reason is attached to `Cancelled` ones.
+    #[oai(
+        path = "/accounts/:account_id/remote-cleanup/jobs/:job_id",
+        method = "get",
+        operation_id = "accounts_remote_cleanup_job"
+    )]
+    async fn accounts_remote_cleanup_job(
+        &self,
+        /// The account the job belongs to
+        account_id: Path<u64>,
+        /// The job id returned when it was started
+        job_id: Path<String>,
+        context: WrappedContext,
+    ) -> ApiResult<Json<CleanupJob>> {
+        let account_id = account_id.0;
+        AccountModel::check_account_exists(account_id)?;
+        // A cleanup job can move or delete mail, so its result is not merely
+        // account metadata.
+        context.require_permission(Some(account_id), Permission::ACCOUNT_MANAGE)?;
+        Ok(Json(get_job(account_id, &job_id.0)?))
+    }
+
+    /// Ask a running cleanup job to stop. The worker checks between messages,
+    /// so the job ends at the next message boundary; poll the job to see the
+    /// final status and counters.
+    #[oai(
+        path = "/accounts/:account_id/remote-cleanup/jobs/:job_id/cancel",
+        method = "post",
+        operation_id = "accounts_remote_cleanup_job_cancel"
+    )]
+    async fn accounts_remote_cleanup_job_cancel(
+        &self,
+        /// The account the job belongs to
+        account_id: Path<u64>,
+        /// The job id to cancel
+        job_id: Path<String>,
+        context: WrappedContext,
+    ) -> ApiResult<Json<CleanupJob>> {
+        let account_id = account_id.0;
+        AccountModel::check_account_exists(account_id)?;
+        context.require_permission(Some(account_id), Permission::ACCOUNT_MANAGE)?;
+        Ok(Json(cancel_job(account_id, &job_id.0)?))
     }
 
     /// Start a manual download task for an account

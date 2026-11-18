@@ -29,9 +29,24 @@ export type SearchDialogType =
   | 'edit-tags'
   | 'update-tags'
   | 'restore'
+  | 'repair'
   | 'delete-mailbox'
+  /// The GDPR Art. 17 erasure request form. Its own dialog rather than a mode
+  /// of the delete dialog: the two ask for different things (a typed
+  /// confirmation versus a recorded assessment) and one of them leaves a
+  /// record a supervisory authority can read.
+  | 'gdpr-erasure'
 
 export type { DateDisplayMode }
+
+/// "Select all results matching this filter", rather than only the current
+/// page. `filterJson` is the snapshot that produced `total`; if the live filter
+/// changes while the scope is active the scope is dropped, so a stale count can
+/// never become a deletion of a different result set.
+export interface SelectAllScope {
+  filterJson: string
+  total: number
+}
 
 interface SearchContextType {
   open: SearchDialogType | null
@@ -44,6 +59,8 @@ interface SearchContextType {
   setToDelete: React.Dispatch<React.SetStateAction<Map<number, Set<string>>>>
   selected: Map<number, Set<string>>
   setSelected: React.Dispatch<React.SetStateAction<Map<number, Set<string>>>>
+  selectAllScope: SelectAllScope | null
+  setSelectAllScope: React.Dispatch<React.SetStateAction<SelectAllScope | null>>
   deleteMailboxId: string | undefined
   setDeleteMailboxId: React.Dispatch<React.SetStateAction<string | undefined>>
   selectedAccountId: number | undefined
@@ -61,6 +78,9 @@ interface SearchContextType {
   handleTagToggle: (tag: string) => void
   editTagsOpen: boolean
   setEditTagsOpen: (open: boolean) => void
+  /// Kept out of `SearchDialogType` on purpose: that union is driven by
+  /// `useDialogState`, whose setter toggles, so the history drawer would
+  /// become mutually exclusive with the dialogs instead of layering over them.
   dateDisplay: DateDisplayMode
   setDateDisplay: (mode: DateDisplayMode) => void
 }

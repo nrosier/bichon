@@ -3,7 +3,7 @@ import { Sparkles } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { Badge } from '@/components/ui/badge'
 import { SearchRefreshButton } from '@/components/search-refresh-button'
-import { SavedSearchesDropdown } from '../../saved-searches/saved-searches-dropdown'
+import { SearchActionsMenu } from '../search-actions-menu'
 import { AccountPopover } from '../account-popover'
 import { MailFilterPopover } from '../contact-popover'
 import { useSearchContext } from '../context'
@@ -22,14 +22,23 @@ type DataTableToolbarProps<TData> = {
 export function DataTableToolbar<TData>({
   table,
 }: DataTableToolbarProps<TData>) {
-  const { filter, setFilter, effectiveSort, refetch, isFetching } =
-    useSearchContext()
+  const {
+    filter,
+    setFilter,
+    effectiveSort,
+    refetch,
+    isFetching,
+  } = useSearchContext()
   const { t } = useTranslation()
   return (
     <div className='flex flex-col gap-1 p-1 bg-background'>
-      <div className='mb-4 flex items-center justify-center w-full'>
-        <div className='w-full max-w-3xl'>
+      <div className='mb-2 flex items-center justify-center w-full'>
+        {/* `items-start`: the search input is taller than its pill (it carries
+            the hint line below). Centering the row would push Reset below the
+            Search button; `mt-1` centers it on the 36px pill instead. */}
+        <div className='flex items-start justify-center gap-1.5 w-full max-w-[740px]'>
           <TextSearchInput />
+          <FilterResetButton className='mt-1 shrink-0' />
         </div>
       </div>
       <div className='flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2 sm:gap-1'>
@@ -41,12 +50,6 @@ export function DataTableToolbar<TData>({
             <TagFilterPopover />
             <MoreFiltersPopover />
           </div>
-          <FilterResetButton />
-          <SavedSearchesDropdown
-            kind='Email'
-            filter={filter}
-            onApply={(f) => setFilter(f)}
-          />
         </div>
         <div className='flex items-center gap-1 shrink-0'>
           {effectiveSort === 'RELEVANCE' && (
@@ -61,6 +64,11 @@ export function DataTableToolbar<TData>({
           )}
           <TimePopover />
           <DataTableViewOptions table={table} />
+          <SearchActionsMenu
+            kind='Email'
+            filter={filter}
+            onApply={(next) => setFilter(next)}
+          />
           <SearchRefreshButton onRefresh={refetch} isRefreshing={isFetching} />
         </div>
       </div>

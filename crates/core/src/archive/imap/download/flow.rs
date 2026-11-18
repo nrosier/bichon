@@ -28,13 +28,14 @@ use crate::{
                 download::rebuild::{rebuild_mailbox_cache, rebuild_mailbox_cache_by_date},
                 find_intersecting_mailboxes, find_missing_mailboxes,
                 mailbox::MailBox,
+                tombstones,
             },
             SEMAPHORE,
         },
         error::{code::ErrorCode, BichonResult},
         imap::executor::{
-            compress_uid_list, generate_uid_sequence_hashset, slow_server_message, ImapExecutor,
-            DEFAULT_BATCH_SIZE,
+            compress_uid_list, generate_uid_sequence_hashset, slow_server_message, FetchOutcome,
+            ImapExecutor, DEFAULT_BATCH_SIZE,
         },
         store::tantivy::envelope::ENVELOPE_MANAGER,
     },
@@ -43,7 +44,182 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-const MAX_NETWORK_RETRIES: u32 = 3;
+pub(crate) const MAX_NETWORK_RETRIES: u32 = 3;
+
+/// Consecutive folders that may fail with a *network* error before the round
+/// treats the server as throttling and defers the remaining folders (#396).
+/// An explicit IMAP throttle response defers immediately; this covers servers
+/// that go silent instead.
+pub(crate) const STALLED_FOLDER_THRESHOLD: u32 = 2;
+
+/// Whether an error is worth retrying on a fresh connection. Throttling is
+/// retryable too — just much more slowly (see [`retry_backoff_secs`]).
+pub(crate) fn is_retryable_error(code: ErrorCode) -> bool {
+    matches!(code, ErrorCode::NetworkError | ErrorCode::ImapServerThrottled)
+}
+
+/// Retry policy for a *connection-level* operation (LOGIN, LIST, EXAMINE).
+///
+/// Batch fetches have their own retry loops; the operations that open the
+/// session used to have none, so a single timeout while a throttling server
+/// ignored a new login failed the whole folder — or the whole sync round
+/// (#396). Only transient transport failures are retried: a protocol or
+/// authentication rejection will not change on a fresh connection, and a
+/// cancelled round must stop immediately.
+pub(crate) fn should_retry_network(code: ErrorCode, retries: u32, cancelled: bool) -> bool {
+    !cancelled && retries < MAX_NETWORK_RETRIES && is_retryable_error(code)
+}
+
+/// Backoff duration for a retry.
+///
+/// Test builds retry immediately: the retry loops are exercised by unit tests
+/// that assert attempt counts, and waiting out a 5/30/120 s table would make
+/// those tests unusably slow. Production uses the real backoff.
+fn retry_sleep(seconds: u64) -> Duration {
+    #[cfg(test)]
+    {
+        let _ = seconds;
+        Duration::ZERO
+    }
+    #[cfg(not(test))]
+    {
+        Duration::from_secs(seconds)
+    }
+}
+
+/// Run a connection-level operation, retrying transient failures with the
+/// shared backoff and retry budget.
+///
+/// `op` is called again from scratch on every attempt, so a caller whose
+/// operation owns a connection (LOGIN + LIST, connect + EXAMINE) rebuilds it
+/// inside `op` instead of reusing a session that may be dead.
+pub(crate) async fn retry_network_op<T, F, Fut>(
+    mut op: F,
+    token: &CancellationToken,
+) -> BichonResult<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = BichonResult<T>>,
+{
+    let mut retries = 0u32;
+    loop {
+        match op().await {
+            Ok(value) => return Ok(value),
+            Err(e) if should_retry_network(e.code(), retries, token.is_cancelled()) => {
+                retries += 1;
+                let backoff = retry_backoff_secs(e.code(), retries);
+                warn!(
+                    retries,
+                    error = %e,
+                    "IMAP connection-level operation failed; retrying in {}s ({}/{})",
+                    backoff,
+                    retries,
+                    MAX_NETWORK_RETRIES
+                );
+                tokio::time::sleep(retry_sleep(backoff)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Seconds to wait before retry number `retry` (1-based).
+///
+/// A throttled server needs far longer than a transient network blip before
+/// it will accept the next command; retrying a throttle after 5 s is what
+/// turned one refusal into a 72-login storm in the #396 logs.
+pub(crate) fn retry_backoff_secs(code: ErrorCode, retry: u32) -> u64 {
+    let table: [u64; 3] = if code == ErrorCode::ImapServerThrottled {
+        [30, 60, 120]
+    } else {
+        [5, 15, 30]
+    };
+    table[(retry.saturating_sub(1) as usize).min(table.len() - 1)]
+}
+
+/// Whether the server is refusing this account's commands outright. Further
+/// folders in the same round would only burn more of its quota, so the round
+/// stops and the account backs off instead (#396).
+pub(crate) fn is_throttle_error(e: &crate::error::BichonError) -> bool {
+    e.code() == ErrorCode::ImapServerThrottled
+}
+
+/// When `UIDNEXT` has not passed the local watermark, no message can be new,
+/// so the folder can be skipped without opening a connection at all.
+///
+/// `None` means "cannot tell, do the normal sync" (no stored watermark yet,
+/// or the server does not report `UIDNEXT` in `STATUS`).
+fn incremental_skip_target(
+    remote_uid_next: Option<u32>,
+    local_highest: Option<u32>,
+) -> Option<u32> {
+    let next = remote_uid_next?;
+    let highest = local_highest?;
+    ((next as u64) <= highest as u64 + 1).then_some(highest)
+}
+
+/// Watermark to persist after an incremental round.
+///
+/// `fetch_new_mail` returns `None` when the folder has no new mail, and a
+/// database upgraded from a version that did not store `highest_uid` has no
+/// stored watermark either. The index maximum used to pick the start UID is
+/// then the highest archived UID, i.e. the correct watermark. Returning `None`
+/// instead made reconcile keep `None`, so every later round re-ran the Tantivy
+/// query, re-opened a connection (the UIDNEXT shortcut needs a stored
+/// watermark) and re-logged the fallback warning forever (#411).
+fn incremental_highest_uid(
+    new_max_uid: Option<u32>,
+    stored_highest: Option<u32>,
+    index_max_uid: Option<u32>,
+) -> Option<u32> {
+    new_max_uid.or(stored_highest).or(index_max_uid)
+}
+
+/// Per-round result of [`reconcile_mailboxes`].
+#[derive(Clone, Debug, Default)]
+pub struct ReconcileSummary {
+    /// Folders that completed this round.
+    pub synced_folders: u32,
+    /// Folders that failed this round (they are retried next round).
+    pub failed_folders: u32,
+    /// The round was cut short because the server throttled the account;
+    /// folders after that point were not attempted at all.
+    pub throttled: bool,
+}
+
+/// Maps a round summary to the session status the UI shows. Never `Success`
+/// when any folder failed or was deferred — that is the whole point of
+/// `Partial` (#396).
+pub(crate) fn session_status_for(
+    summary: &ReconcileSummary,
+) -> (crate::account::state::DownloadStatus, Option<String>) {
+    use crate::account::state::DownloadStatus;
+    let problem = summary.throttled || summary.failed_folders > 0;
+    if !problem {
+        return (DownloadStatus::Success, None);
+    }
+
+    let message = if summary.throttled {
+        format!(
+            "IMAP server throttled this account: {} folder(s) synced, the remaining folders \
+             were deferred to the next sync. Bichon backs off instead of retrying immediately.",
+            summary.synced_folders
+        )
+    } else {
+        format!(
+            "{} folder(s) synced, {} failed. Failed folders are retried on the next sync.",
+            summary.synced_folders, summary.failed_folders
+        )
+    };
+
+    // Nothing completed: this round is a failure, not a partial success.
+    let status = if summary.synced_folders == 0 {
+        DownloadStatus::Failed
+    } else {
+        DownloadStatus::Partial
+    };
+    (status, Some(message))
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FetchDirection {
@@ -51,11 +227,45 @@ pub enum FetchDirection {
     Before,
 }
 
+/// Drops the UIDs that are already archived for this mailbox.
+///
+/// The full-download paths enumerate the whole (date-filtered) mailbox. When a
+/// part of it is already archived — the download state was lost, the index was
+/// restored, or the previous round stored the bodies but stopped before the
+/// watermark was written — re-downloading those bodies only for the
+/// content-hash dedup to discard them wastes the server's quota, and on a
+/// throttled server it is exactly what triggers the next throttle. The caller
+/// keeps the *unfiltered* maximum as the watermark: everything enumerated was
+/// covered, whether it had to be downloaded or was already present.
+///
+/// `skip_archived` is only passed for folders whose local `uid_validity`
+/// matches the server's, because after a UIDVALIDITY change the archived
+/// `uid` values belong to the previous generation and comparing them would
+/// skip genuinely missing mail.
+pub(crate) fn drop_archived_uids(
+    account_id: u64,
+    mailbox_id: u64,
+    uids: Vec<u32>,
+) -> BichonResult<Vec<u32>> {
+    let (Some(&first), Some(&last)) = (uids.first(), uids.last()) else {
+        return Ok(uids);
+    };
+    let archived = ENVELOPE_MANAGER.get_uids_in_range(account_id, mailbox_id, first, last)?;
+    if archived.is_empty() {
+        return Ok(uids);
+    }
+    Ok(uids
+        .into_iter()
+        .filter(|uid| !archived.contains(uid))
+        .collect())
+}
+
 pub async fn fetch_and_save_by_date(
     account: &AccountModel,
     date: &str,
     mailbox: &MailBox,
     direction: FetchDirection,
+    skip_archived: bool,
     token: CancellationToken,
 ) -> BichonResult<Option<u32>> {
     let account_id = account.id;
@@ -118,7 +328,42 @@ pub async fn fetch_and_save_by_date(
     let mut uid_vec: Vec<u32> = uid_list.into_iter().collect();
     uid_vec.sort();
 
+    // Messages deleted locally must stay deleted. This path is reached on a
+    // re-sync (initial date window / UIDVALIDITY change), which would
+    // otherwise fetch the deleted messages again.
+    let uid_vec =
+        tombstones::filter_uids(account.id, mailbox.id, mailbox.uid_validity, uid_vec)?;
+    if uid_vec.is_empty() {
+        DownloadState::update_folder_progress(
+            account_id,
+            mailbox.name.clone(),
+            0,
+            0,
+            FolderStatus::Success,
+            Some("Nothing to download: every candidate was deleted locally.".into()),
+        )?;
+        return Ok(None);
+    }
+
+    // The watermark covers the whole enumerated window, so take it before the
+    // archived-UID filter below can shrink the list.
     let max_uid = uid_vec.last().copied();
+    let uid_vec = if skip_archived {
+        drop_archived_uids(account_id, mailbox.id, uid_vec)?
+    } else {
+        uid_vec
+    };
+    if uid_vec.is_empty() {
+        DownloadState::update_folder_progress(
+            account_id,
+            mailbox.name.clone(),
+            0,
+            0,
+            FolderStatus::Success,
+            Some("Nothing to download: the window is already archived.".into()),
+        )?;
+        return Ok(max_uid);
+    }
     let planned = uid_vec.len() as u64;
     let uid_batches = generate_uid_sequence_hashset(
         uid_vec,
@@ -140,6 +385,7 @@ pub async fn fetch_and_save_by_date(
     // reported so the running state carries a warning (they stay "missing"
     // locally, so gap-fill keeps detecting them).
     let mut parse_skipped = 0u64;
+    let mut filtered = 0u64;
     let mut has_error_or_cancel = false;
     for (index, batch) in uid_batches.into_iter().enumerate() {
         if token.is_cancelled() {
@@ -169,7 +415,7 @@ pub async fn fetch_and_save_by_date(
                 &batch.0,
                 account.max_email_size_bytes,
                 token.clone(),
-                Some(&|cumulative, avg_secs, stall_secs| {
+                Some(&|cumulative, _cumulative_filtered, avg_secs, stall_secs| {
                     // Per-message progress: the current batch's cumulative count
                     // keeps the UI moving while a slow server trickles messages.
                     let _ = DownloadState::update_folder_progress(
@@ -186,14 +432,20 @@ pub async fn fetch_and_save_by_date(
             .await
             {
                 Ok(outcome) => break Ok(outcome),
-                Err(e) if retries < MAX_NETWORK_RETRIES && e.code() == ErrorCode::NetworkError => {
+                Err(e) if retries < MAX_NETWORK_RETRIES && is_retryable_error(e.code()) => {
                     retries += 1;
+                    let code = e.code();
                     warn!(
                         account_id,
                         mailbox = mailbox.name,
                         index,
                         retries,
-                        "Network error on batch, reconnecting ({}/{})",
+                        "{} on batch, reconnecting ({}/{})",
+                        if code == ErrorCode::ImapServerThrottled {
+                            "Server throttling"
+                        } else {
+                            "Network error"
+                        },
                         retries,
                         MAX_NETWORK_RETRIES
                     );
@@ -206,9 +458,10 @@ pub async fn fetch_and_save_by_date(
                                 DownloadState::append_session_error(account_id, err_msg)?;
                                 break Err(e);
                             }
-                            // Longer backoff than the original 1s/2s/4s: a
-                            // throttling server needs time to recover.
-                            let backoff = [5u64, 15, 30][(retries - 1) as usize];
+                            // A throttled server needs much longer than a
+                            // transient network blip before it will accept
+                            // the next command.
+                            let backoff = retry_backoff_secs(code, retries);
                             tokio::time::sleep(Duration::from_secs(backoff)).await;
                             continue;
                         }
@@ -225,14 +478,23 @@ pub async fn fetch_and_save_by_date(
             Ok(outcome) => {
                 current_processed += outcome.stored;
                 parse_skipped += outcome.parse_skipped;
-                DownloadState::update_folder_progress(
+                filtered += outcome.filtered;
+                DownloadState::update_folder_progress_and_filtered(
                     account_id,
                     mailbox.name.clone(),
                     planned,
                     current_processed,
+                    filtered,
                     FolderStatus::Downloading,
                     None,
                 )?;
+                // Resume cursor: the batches come from a UID-sorted list, so
+                // the batch maximum is a contiguous cursor. A round interrupted
+                // after this point (throttling, network, user stop) resumes at
+                // the next batch instead of re-downloading the whole range.
+                // The watermark only ever moves forward, so a stale in-memory
+                // snapshot of the mailbox cannot undo this.
+                MailBox::advance_watermark(mailbox.id, batch.2)?;
             }
             Err(e) => {
                 let err_msg = format!("Batch {} failed: {:#?}", index, e);
@@ -290,6 +552,7 @@ pub async fn fetch_and_save_by_date(
 pub async fn fetch_and_save_full_mailbox(
     account: &AccountModel,
     mailbox: &MailBox,
+    skip_archived: bool,
     token: CancellationToken,
 ) -> BichonResult<Option<u32>> {
     let mailbox_id = mailbox.id;
@@ -344,11 +607,24 @@ pub async fn fetch_and_save_full_mailbox(
     let mut uid_list: Vec<u32> = uid_list.into_iter().collect();
     uid_list.sort();
 
+    // Locally deleted messages are tombstoned; a full re-sync must not bring
+    // them back.
+    let uid_list = tombstones::filter_uids(account.id, mailbox.id, mailbox.uid_validity, uid_list)?;
+
+    // The watermark must cover everything enumerated, so take it before the
+    // archived-UID filter below can shrink the list.
+    let max_uid = uid_list.last().copied();
+    let enumerated = uid_list.len() as u64;
+    let uid_list = if skip_archived {
+        drop_archived_uids(account_id, mailbox_id, uid_list)?
+    } else {
+        uid_list
+    };
     let planned = uid_list.len() as u64;
     if planned == 0 {
         info!(
-            "Mailbox '{}' is empty, no emails to download.",
-            mailbox.name
+            "Mailbox '{}': nothing to download ({} enumerated, all archived or skipped).",
+            mailbox.name, enumerated
         );
         DownloadState::update_folder_progress(
             account_id,
@@ -356,13 +632,12 @@ pub async fn fetch_and_save_full_mailbox(
             0,
             0,
             FolderStatus::Success,
-            None,
+            Some("Nothing to download: the mailbox is empty or already archived.".into()),
         )?;
         session.logout().await.ok();
-        return Ok(None);
+        return Ok(max_uid);
     }
 
-    let max_uid = *uid_list.last().unwrap();
     let page_size = account.download_batch_size.unwrap_or(DEFAULT_BATCH_SIZE) as usize;
     let uid_batches = generate_uid_sequence_hashset(uid_list, page_size);
     let total_batches = uid_batches.len();
@@ -379,6 +654,7 @@ pub async fn fetch_and_save_full_mailbox(
     // reported so the running state carries a warning (they stay "missing"
     // locally, so gap-fill keeps detecting them).
     let mut parse_skipped = 0u64;
+    let mut filtered = 0u64;
     let mut has_error_or_cancel = false;
 
     for (index, batch) in uid_batches.into_iter().enumerate() {
@@ -417,7 +693,7 @@ pub async fn fetch_and_save_full_mailbox(
                 &batch.0,
                 account.max_email_size_bytes,
                 token.clone(),
-                Some(&|cumulative, avg_secs, stall_secs| {
+                Some(&|cumulative, _cumulative_filtered, avg_secs, stall_secs| {
                     // Per-message progress: the current batch's cumulative count
                     // keeps the UI moving while a slow server trickles messages.
                     let _ = DownloadState::update_folder_progress(
@@ -434,14 +710,20 @@ pub async fn fetch_and_save_full_mailbox(
             .await
             {
                 Ok(outcome) => break Ok(outcome),
-                Err(e) if retries < MAX_NETWORK_RETRIES && e.code() == ErrorCode::NetworkError => {
+                Err(e) if retries < MAX_NETWORK_RETRIES && is_retryable_error(e.code()) => {
                     retries += 1;
+                    let code = e.code();
                     warn!(
                         account_id,
                         mailbox = mailbox.name,
                         index,
                         retries,
-                        "Network error on batch, reconnecting ({}/{})",
+                        "{} on batch, reconnecting ({}/{})",
+                        if code == ErrorCode::ImapServerThrottled {
+                            "Server throttling"
+                        } else {
+                            "Network error"
+                        },
                         retries,
                         MAX_NETWORK_RETRIES
                     );
@@ -456,9 +738,10 @@ pub async fn fetch_and_save_full_mailbox(
                                 DownloadState::append_session_error(account_id, err_msg)?;
                                 break Err(e);
                             }
-                            // Longer backoff than the original 1s/2s/4s: a
-                            // throttling server needs time to recover.
-                            let backoff = [5u64, 15, 30][(retries - 1) as usize];
+                            // A throttled server needs much longer than a
+                            // transient network blip before it will accept
+                            // the next command.
+                            let backoff = retry_backoff_secs(code, retries);
                             tokio::time::sleep(Duration::from_secs(backoff)).await;
                             continue;
                         }
@@ -475,14 +758,23 @@ pub async fn fetch_and_save_full_mailbox(
             Ok(outcome) => {
                 current_processed += outcome.stored;
                 parse_skipped += outcome.parse_skipped;
-                DownloadState::update_folder_progress(
+                filtered += outcome.filtered;
+                DownloadState::update_folder_progress_and_filtered(
                     account_id,
                     mailbox.name.clone(),
                     planned,
                     current_processed,
+                    filtered,
                     FolderStatus::Downloading,
                     None,
                 )?;
+                // Resume cursor: the batches come from a UID-sorted list, so
+                // the batch maximum is a contiguous cursor. A round interrupted
+                // after this point (throttling, network, user stop) resumes at
+                // the next batch instead of re-downloading the whole range.
+                // The watermark only ever moves forward, so a stale in-memory
+                // snapshot of the mailbox cannot undo this.
+                MailBox::advance_watermark(mailbox.id, batch.2)?;
             }
             Err(e) => {
                 let err_msg = format!("Batch {} failed: {:#?}", index, e);
@@ -531,7 +823,7 @@ pub async fn fetch_and_save_full_mailbox(
     if has_error_or_cancel {
         Ok(None)
     } else {
-        Ok(Some(max_uid))
+        Ok(max_uid)
     }
 }
 
@@ -546,10 +838,8 @@ fn generate_synthetic_uidvalidity(mailbox_name: &str) -> u32 {
     (hasher.finish() as u32).wrapping_add(1) // Avoid 0, which might be reserved
 }
 
-/// Retry fetching UIDVALIDITY via STATUS command when the initial listing returned None.
-/// A None UIDVALIDITY while other STATUS fields (MESSAGES, UNSEEN, UIDNEXT) are present
-/// can be caused by transient network issues corrupting just the UIDVALIDITY portion of
-/// the response. Retrying avoids unnecessarily triggering a full reconcile.
+/// Retry reading UIDVALIDITY when the initial listing returned None, using the
+/// same STATUS/EXAMINE compatibility handling as mailbox discovery.
 async fn fetch_uid_validity_with_retry(
     account_id: u64,
     mailbox_name: &str,
@@ -561,14 +851,9 @@ async fn fetch_uid_validity_with_retry(
         let mailbox_name = mailbox_name.clone();
         async move {
             let mut session = ImapExecutor::create_connection(account_id).await?;
-            let result = session
-                .status(&mailbox_name, "(UIDVALIDITY)")
+            let result = ImapExecutor::mailbox_metadata(&mut session, &mailbox_name)
                 .await
-                .map(|r| r.uid_validity)
-                .map_err(|e| {
-                    let msg = format!("STATUS failed during UIDVALIDITY retry: {:#?}", e);
-                    raise_error!(msg, ErrorCode::InternalError)
-                });
+                .map(|r| r.uid_validity);
             session.logout().await.ok();
             result
         }
@@ -749,6 +1034,7 @@ async fn reconcile_uid_validity_change(
         // Messages skipped because they could not be parsed (not archived);
         // reported as a folder-level warning once the batch loop ends.
         let mut parse_skipped = 0u64;
+        let mut filtered = 0u64;
         for (index, batch) in batches.into_iter().enumerate() {
             if token.is_cancelled() {
                 DownloadState::update_folder_progress(
@@ -770,7 +1056,7 @@ async fn reconcile_uid_validity_change(
                 &batch.0,
                 account.max_email_size_bytes,
                 token.clone(),
-                Some(&|cumulative, avg_secs, stall_secs| {
+                Some(&|cumulative, _cumulative_filtered, avg_secs, stall_secs| {
                     // Per-message progress: the current batch's cumulative count
                     // keeps the UI moving while a slow server trickles messages.
                     let _ = DownloadState::update_folder_progress(
@@ -789,11 +1075,13 @@ async fn reconcile_uid_validity_change(
                 Ok(outcome) => {
                     downloaded += outcome.stored;
                     parse_skipped += outcome.parse_skipped;
-                    DownloadState::update_folder_progress(
+                    filtered += outcome.filtered;
+                    DownloadState::update_folder_progress_and_filtered(
                         account_id,
                         remote_mailbox.name.clone(),
                         planned,
                         downloaded,
+                        filtered,
                         FolderStatus::Downloading,
                         None,
                     )?;
@@ -844,14 +1132,16 @@ pub async fn reconcile_mailboxes(
     remote_mailboxes: &[MailBox],
     local_mailboxes: &[MailBox],
     token: CancellationToken,
-) -> BichonResult<()> {
+) -> BichonResult<ReconcileSummary> {
     let start_time = Instant::now();
     let existing_mailboxes = find_intersecting_mailboxes(local_mailboxes, remote_mailboxes);
     let account_id = account.id;
-    // Folders whose sync failed this round. A failed folder must fail the
-    // session (so it is not reported as Success), but must not stop the other
-    // folders from being attempted (#377).
-    let mut failed_folders = 0u32;
+    // A failed folder must not stop the other folders from being attempted
+    // (#377), but it must keep the session from reporting Success — the
+    // caller maps `failed_folders > 0` to `Partial` (#396). A *throttled*
+    // folder is different: the server has started refusing this account, so
+    // continuing only burns more of its quota.
+    let mut summary = ReconcileSummary::default();
     if !existing_mailboxes.is_empty() {
         let mut mailboxes_to_update = Vec::with_capacity(existing_mailboxes.len());
 
@@ -859,6 +1149,13 @@ pub async fn reconcile_mailboxes(
             account.id,
             remote_mailboxes.iter().map(|m| m.name.clone()).collect(),
         )?;
+
+        // Consecutive folders that failed with a *network* error. A server
+        // that is rate-limiting a large account often stops answering instead
+        // of sending an IMAP throttle response (#396): after this many in a
+        // row, defer the rest of the round instead of opening another login
+        // per folder and prolonging the lockout.
+        let mut consecutive_network_failures = 0u32;
 
         for (local_mailbox, remote_mailbox) in &existing_mailboxes {
             if token.is_cancelled() {
@@ -921,7 +1218,7 @@ pub async fn reconcile_mailboxes(
                 }
             };
 
-            let new_highest_uid = if local_mailbox.uid_validity != Some(remote_uid_validity) {
+            let outcome = if local_mailbox.uid_validity != Some(remote_uid_validity) {
                 info!(
                     "Account {}: Mailbox '{}' detected with changed uid_validity (local: {:#?}, remote: {:#?}). \
                     Comparing by Message-ID to find missing emails.",
@@ -930,23 +1227,67 @@ pub async fn reconcile_mailboxes(
 
                 reconcile_uid_validity_change(account, local_mailbox, remote_mailbox, token.clone())
                     .await
+                    .map(|highest_uid| FetchOutcome {
+                        highest_uid,
+                        stalled: false,
+                    })
             } else {
                 perform_incremental_sync(account, local_mailbox, remote_mailbox, token.clone())
                     .await
             };
             // A folder failure must not abort the remaining folders: record
-            // it, keep the session honest (reconcile returns Err at the end so
-            // the session is not reported as Success), and move on.
-            let new_highest_uid = match new_highest_uid {
+            // it, keep the session honest (the caller maps failed folders to
+            // `Partial`), and move on. Throttling is the exception: every
+            // further folder would open a new connection that the server is
+            // already refusing, so the round stops here.
+            let outcome = match outcome {
                 Ok(v) => v,
                 Err(e) => {
-                    failed_folders += 1;
                     let err_msg = format!("Folder '{}' sync failed: {:#?}", remote_mailbox.name, e);
                     warn!(account_id, "{}", err_msg);
                     DownloadState::append_session_error(account.id, err_msg)?;
+                    if is_throttle_error(&e) {
+                        summary.throttled = true;
+                        warn!(
+                            account_id,
+                            "Server throttled this account; deferring the remaining folders"
+                        );
+                        break;
+                    }
+                    // Silence/timeouts are how a rate-limiting server usually
+                    // behaves here; treat a run of them as throttling too.
+                    if e.code() == ErrorCode::NetworkError {
+                        consecutive_network_failures += 1;
+                        if consecutive_network_failures >= STALLED_FOLDER_THRESHOLD {
+                            summary.throttled = true;
+                            warn!(
+                                account_id,
+                                failures = consecutive_network_failures,
+                                "The IMAP server stopped answering; deferring the remaining folders"
+                            );
+                            break;
+                        }
+                    } else {
+                        consecutive_network_failures = 0;
+                    }
+                    summary.failed_folders += 1;
                     continue;
                 }
             };
+            // Repeated intra-batch stalls are the same signal without an error
+            // code: stop before the server starts refusing logins outright.
+            if outcome.stalled {
+                summary.throttled = true;
+                warn!(
+                    account_id,
+                    mailbox = %remote_mailbox.name,
+                    "Repeated stalls from the IMAP server; deferring the remaining folders"
+                );
+                break;
+            }
+            consecutive_network_failures = 0;
+            let new_highest_uid = outcome.highest_uid;
+            summary.synced_folders += 1;
             info!(
                 account_id,
                 mailbox = %remote_mailbox.name,
@@ -986,12 +1327,15 @@ pub async fn reconcile_mailboxes(
 
     let missing_mailboxes = find_missing_mailboxes(local_mailboxes, remote_mailboxes);
     //Mail folders that are not locally need to be downloaded.
+    // A throttled round does not attempt them either: each one opens another
+    // connection that the server is already refusing.
     if !missing_mailboxes.is_empty() {
         MailBox::batch_insert(&missing_mailboxes)?;
 
-        let mut has_error = false;
-        let mut last_err = None;
         for mailbox in &missing_mailboxes {
+            if summary.throttled {
+                break;
+            }
             if token.is_cancelled() {
                 DownloadState::update_session_status(
                     account.id,
@@ -1011,6 +1355,7 @@ pub async fn reconcile_mailboxes(
                             "Failed to acquire global semaphore permit for account {} mailbox '{}': {:#?}",
                             account.id, &mailbox.name, err
                         );
+                        summary.failed_folders += 1;
                         continue;
                     }
                 };
@@ -1047,53 +1392,99 @@ pub async fn reconcile_mailboxes(
 
                 match result {
                     Ok(new_highest_uid) => {
-                        let mut updated = mailbox.clone();
-                        updated.highest_uid = new_highest_uid;
-                        MailBox::batch_upsert(&[updated])?;
+                        // `None` means the download broke mid-way (or the
+                        // folder is empty). Writing it would clear the batch
+                        // checkpoints the download persisted, so the next round
+                        // would restart from the top of the folder (#377).
+                        if let Some(uid) = new_highest_uid {
+                            let mut updated = mailbox.clone();
+                            updated.highest_uid = Some(uid);
+                            MailBox::batch_upsert(&[updated])?;
+                        }
+                        summary.synced_folders += 1;
                     }
                     Err(err) => {
-                        has_error = true;
-                        tracing::error!("Folder sync task failed: {:#?}", err);
-                        last_err = Some(err);
+                        tracing::error!(mailbox = %mailbox.name, "Folder sync task failed: {:#?}", err);
+                        if is_throttle_error(&err) {
+                            summary.throttled = true;
+                            warn!(
+                                account.id,
+                                "Server throttled this account; deferring the remaining folders"
+                            );
+                            break;
+                        }
+                        summary.failed_folders += 1;
                     }
                 }
+            } else {
+                DownloadState::update_folder_progress(
+                    account.id,
+                    mailbox.name.clone(),
+                    0,
+                    0,
+                    FolderStatus::Success,
+                    None,
+                )?;
+                // Count it, like the incremental path counts an existing
+                // empty folder (#398): a round where one folder failed and one
+                // empty folder completed is Partial, not a total failure.
+                summary.synced_folders += 1;
             }
         }
-
-        if has_error {
-            if let Some(e) = last_err {
-                return Err(e);
-            }
-            return Err(raise_error!(
-                "Some tasks failed".into(),
-                ErrorCode::InternalError
-            ));
-        }
     }
-    // Folders that failed mid-sync must fail the whole session: a Success
-    // session here would tell the user everything was archived when part of
-    // a folder was skipped (#377).
-    if failed_folders > 0 {
-        return Err(raise_error!(
-            format!("{failed_folders} folder(s) failed to sync"),
-            ErrorCode::InternalError
-        ));
-    }
-    Ok(())
+    // The caller maps failures to `Partial` (never `Success`): a Success
+    // session here would tell the user everything was archived when part of a
+    // folder was skipped (#377), and all `Failed` hides that 393 of 394
+    // folders did work (#396).
+    Ok(summary)
 }
 
 //only check new emails and sync
 /// Incrementally syncs a mailbox.
-/// Returns the new highest UID after sync, or `None` if nothing changed.
+/// Returns the new highest UID after sync (`None` if nothing changed) and
+/// whether the server looked throttled while fetching.
 async fn perform_incremental_sync(
     account: &AccountModel,
     local_mailbox: &MailBox,
     remote_mailbox: &MailBox,
     token: CancellationToken,
-) -> BichonResult<Option<u32>> {
+) -> BichonResult<FetchOutcome> {
     if remote_mailbox.exists > 0 {
+        // Fast path: `UIDNEXT` comes from the STATUS the round already ran on
+        // the listing connection. When it has not passed the local watermark,
+        // no message can be new, and the normal path below would connect,
+        // EXAMINE and get an empty `UID FETCH start:*` back — one full
+        // TLS+LOGIN per unchanged folder. With hundreds of folders that
+        // churn is what makes Exchange/Gmail throttle the account (#396).
+        if let Some(highest) =
+            incremental_skip_target(remote_mailbox.uid_next, local_mailbox.highest_uid)
+        {
+            debug!(
+                account_id = account.id,
+                mailbox = %local_mailbox.name,
+                highest_uid = highest,
+                uid_next = remote_mailbox.uid_next,
+                "incremental: UIDNEXT has not passed the watermark, skipping connection"
+            );
+            DownloadState::update_folder_progress(
+                account.id,
+                remote_mailbox.name.clone(),
+                0,
+                0,
+                FolderStatus::Success,
+                Some("No new emails found.".into()),
+            )?;
+            return Ok(FetchOutcome {
+                highest_uid: Some(highest),
+                stalled: false,
+            });
+        }
+
         // Use stored highest_uid if available; otherwise fall back to Tantivy
         // query once (backward compatibility with pre-existing databases).
+        // The index maximum doubles as the watermark when this round finds no
+        // new mail, so the fallback does not have to run again next round.
+        let mut index_max_uid: Option<u32> = None;
         let start_uid = match local_mailbox.highest_uid {
             Some(uid) => {
                 info!(
@@ -1112,7 +1503,10 @@ async fn perform_incremental_sync(
                 );
                 let local_max_uid = ENVELOPE_MANAGER.get_max_uid(account.id, local_mailbox.id)?;
                 match local_max_uid {
-                    Some(uid) => uid + 1,
+                    Some(uid) => {
+                        index_max_uid = u32::try_from(uid).ok();
+                        uid + 1
+                    }
                     None => {
                         info!(
                             "No maximum UID found in index for mailbox, assuming local storage is missing."
@@ -1124,6 +1518,7 @@ async fn perform_incremental_sync(
                                     date_since.since_date()?.as_str(),
                                     remote_mailbox,
                                     FetchDirection::Since,
+                                    true,
                                     token,
                                 )
                                 .await?
@@ -1135,17 +1530,26 @@ async fn perform_incremental_sync(
                                         &r.calculate_date()?,
                                         remote_mailbox,
                                         FetchDirection::Before,
+                                        true,
                                         token,
                                     )
                                     .await?
                                 }
                                 None => {
-                                    fetch_and_save_full_mailbox(account, remote_mailbox, token)
-                                        .await?
+                                    fetch_and_save_full_mailbox(
+                                        account,
+                                        remote_mailbox,
+                                        true,
+                                        token,
+                                    )
+                                    .await?
                                 }
                             },
                         };
-                        return Ok(result);
+                        return Ok(FetchOutcome {
+                            highest_uid: result,
+                            stalled: false,
+                        });
                     }
                 }
             }
@@ -1182,10 +1586,30 @@ async fn perform_incremental_sync(
         .await?;
         session.logout().await.ok();
 
-        // Keep existing highest_uid if no new mail was fetched.
-        Ok(new_max_uid.or(local_mailbox.highest_uid))
+        // Keep an existing watermark when no new mail was fetched; for an
+        // upgraded database without one, adopt the index maximum so the
+        // fallback (and its warning) runs once instead of every round.
+        Ok(FetchOutcome {
+            highest_uid: incremental_highest_uid(
+                new_max_uid.highest_uid,
+                local_mailbox.highest_uid,
+                index_max_uid,
+            ),
+            stalled: new_max_uid.stalled,
+        })
     } else {
-        Ok(local_mailbox.highest_uid)
+        DownloadState::update_folder_progress(
+            account.id,
+            remote_mailbox.name.clone(),
+            0,
+            0,
+            FolderStatus::Success,
+            None,
+        )?;
+        Ok(FetchOutcome {
+            highest_uid: local_mailbox.highest_uid,
+            stalled: false,
+        })
     }
 }
 
@@ -1199,6 +1623,317 @@ mod tests {
     // ============================================================
     // Pure unit tests (no network)
     // ============================================================
+
+    // ── Retry policy (#396) ────────────────────────────────────────
+
+    #[test]
+    fn network_retries_back_off_5_15_30() {
+        assert_eq!(retry_backoff_secs(ErrorCode::NetworkError, 1), 5);
+        assert_eq!(retry_backoff_secs(ErrorCode::NetworkError, 2), 15);
+        assert_eq!(retry_backoff_secs(ErrorCode::NetworkError, 3), 30);
+        // Defensive: never index out of bounds, never wait 0.
+        assert_eq!(retry_backoff_secs(ErrorCode::NetworkError, 0), 5);
+        assert_eq!(retry_backoff_secs(ErrorCode::NetworkError, 99), 30);
+    }
+
+    #[test]
+    fn throttled_retries_back_off_much_much_longer() {
+        assert_eq!(retry_backoff_secs(ErrorCode::ImapServerThrottled, 1), 30);
+        assert_eq!(retry_backoff_secs(ErrorCode::ImapServerThrottled, 2), 60);
+        assert_eq!(retry_backoff_secs(ErrorCode::ImapServerThrottled, 3), 120);
+        assert_eq!(retry_backoff_secs(ErrorCode::ImapServerThrottled, 99), 120);
+        // Retrying a throttle is pointless before the server's window resets,
+        // so it must always wait longer than a network blip.
+        for attempt in 1..=3 {
+            assert!(
+                retry_backoff_secs(ErrorCode::ImapServerThrottled, attempt)
+                    > retry_backoff_secs(ErrorCode::NetworkError, attempt)
+            );
+        }
+    }
+
+    #[test]
+    fn only_network_and_throttle_errors_are_retried() {
+        assert!(is_retryable_error(ErrorCode::NetworkError));
+        assert!(is_retryable_error(ErrorCode::ImapServerThrottled));
+        assert!(!is_retryable_error(ErrorCode::ImapAuthenticationFailed));
+        assert!(!is_retryable_error(ErrorCode::ImapCommandFailed));
+        assert!(!is_retryable_error(ErrorCode::InternalError));
+    }
+
+    /// Connection-level operations (LOGIN, LIST, EXAMINE) are retried on the
+    /// same terms as batch fetches, but never past the cap, never after a
+    /// cancellation, and never for a failure a fresh connection cannot fix.
+    #[test]
+    fn connection_retries_are_bounded_to_transient_failures() {
+        assert!(should_retry_network(ErrorCode::NetworkError, 0, false));
+        assert!(should_retry_network(ErrorCode::NetworkError, 2, false));
+        assert!(should_retry_network(ErrorCode::ImapServerThrottled, 0, false));
+        assert!(
+            !should_retry_network(ErrorCode::NetworkError, MAX_NETWORK_RETRIES, false),
+            "the retry cap must be honoured"
+        );
+        assert!(
+            !should_retry_network(ErrorCode::NetworkError, 0, true),
+            "a cancelled round must stop immediately"
+        );
+        assert!(!should_retry_network(
+            ErrorCode::ImapAuthenticationFailed,
+            0,
+            false
+        ));
+        assert!(!should_retry_network(ErrorCode::ImapCommandFailed, 0, false));
+        assert!(!should_retry_network(ErrorCode::InternalError, 0, false));
+    }
+
+    #[tokio::test]
+    async fn network_op_retries_until_it_succeeds() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let attempts = AtomicU32::new(0);
+        let token = CancellationToken::new();
+
+        let result: BichonResult<u32> = retry_network_op(
+            || async {
+                let n = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if n < 3 {
+                    Err(raise_error!("timed out".into(), ErrorCode::NetworkError))
+                } else {
+                    Ok(7)
+                }
+            },
+            &token,
+        )
+        .await;
+
+        assert_eq!(result.expect("the third attempt succeeds"), 7);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    /// The initial attempt plus [`MAX_NETWORK_RETRIES`] retries, no more. Time
+    /// is paused so the backoff sleeps do not slow the test.
+    #[tokio::test]
+    async fn network_op_gives_up_after_the_retry_budget() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let attempts = AtomicU32::new(0);
+        let token = CancellationToken::new();
+
+        let result: BichonResult<()> = retry_network_op(
+            || async {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(raise_error!(
+                    "server silent".into(),
+                    ErrorCode::NetworkError
+                ))
+            },
+            &token,
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err().code(), ErrorCode::NetworkError);
+        assert_eq!(attempts.load(Ordering::SeqCst), MAX_NETWORK_RETRIES + 1);
+    }
+
+    /// A permanent failure is not retried, and neither is anything after a
+    /// cancellation — retrying would only hammer a server that already said no.
+    #[tokio::test]
+    async fn network_op_does_not_retry_permanent_failures_or_cancellation() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let attempts = AtomicU32::new(0);
+        let token = CancellationToken::new();
+        let permanent: BichonResult<()> = retry_network_op(
+            || async {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(raise_error!(
+                    "protocol error".into(),
+                    ErrorCode::ImapCommandFailed
+                ))
+            },
+            &token,
+        )
+        .await;
+        assert_eq!(permanent.unwrap_err().code(), ErrorCode::ImapCommandFailed);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        let attempts = AtomicU32::new(0);
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let stopped: BichonResult<()> = retry_network_op(
+            || async {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(raise_error!("timed out".into(), ErrorCode::NetworkError))
+            },
+            &cancelled,
+        )
+        .await;
+        assert_eq!(stopped.unwrap_err().code(), ErrorCode::NetworkError);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn throttle_error_detection_uses_the_error_code() {
+        let throttled = raise_error!("x".into(), ErrorCode::ImapServerThrottled);
+        let auth = raise_error!("x".into(), ErrorCode::ImapAuthenticationFailed);
+        assert!(is_throttle_error(&throttled));
+        assert!(!is_throttle_error(&auth));
+    }
+
+    // ── UIDNEXT short-circuit (#396) ───────────────────────────────
+
+    #[test]
+    fn unchanged_uidnext_skips_the_connection() {
+        // UIDNEXT == highest+1: the next assigned UID would be highest+1, so
+        // nothing exists above the watermark.
+        assert_eq!(incremental_skip_target(Some(151), Some(150)), Some(150));
+        // UIDNEXT below the watermark (server reuse/manual fix-up) is also a skip.
+        assert_eq!(incremental_skip_target(Some(120), Some(150)), Some(150));
+    }
+
+    #[test]
+    fn advanced_uidnext_does_not_skip() {
+        assert_eq!(incremental_skip_target(Some(152), Some(150)), None);
+        assert_eq!(incremental_skip_target(Some(153), Some(150)), None);
+    }
+
+    #[test]
+    fn missing_inputs_never_skip() {
+        // No local watermark yet: the Tantivy fallback must run.
+        assert_eq!(incremental_skip_target(Some(151), None), None);
+        // Server did not report UIDNEXT: sync normally.
+        assert_eq!(incremental_skip_target(None, Some(150)), None);
+        assert_eq!(incremental_skip_target(None, None), None);
+    }
+
+    // ── Watermark persistence for upgraded databases (#411) ────────
+
+    #[test]
+    fn no_new_mail_adopts_the_index_maximum_as_the_watermark() {
+        // Upgraded database: no stored watermark and the folder has no new
+        // mail. The index maximum is the highest archived UID, so it must be
+        // persisted; returning None made every round repeat the Tantivy
+        // query, the connection and the "no stored highest_uid" warning.
+        assert_eq!(
+            incremental_highest_uid(None, None, Some(13_328)),
+            Some(13_328)
+        );
+    }
+
+    #[test]
+    fn fetched_mail_wins_over_the_fallback() {
+        assert_eq!(
+            incremental_highest_uid(Some(13_330), None, Some(13_328)),
+            Some(13_330)
+        );
+    }
+
+    #[test]
+    fn stored_watermark_wins_over_the_index_maximum() {
+        // The index can be behind (batched commits) or ahead (other archive
+        // paths); a stored watermark is authoritative and must not move.
+        assert_eq!(
+            incremental_highest_uid(None, Some(100), Some(13_328)),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn no_watermark_inputs_leave_it_unset() {
+        assert_eq!(incremental_highest_uid(None, None, None), None);
+    }
+
+    #[test]
+    fn adopted_index_maximum_enables_the_uidnext_shortcut() {
+        // Once the index maximum is saved, the next round skips the
+        // connection entirely when UIDNEXT has not moved past it.
+        let watermark = incremental_highest_uid(None, None, Some(13_328));
+        assert_eq!(
+            incremental_skip_target(Some(13_329), watermark),
+            Some(13_328)
+        );
+    }
+
+    // ── Session status mapping (#396) ──────────────────────────────
+
+    #[test]
+    fn clean_round_is_success() {
+        let (status, message) = session_status_for(&ReconcileSummary {
+            synced_folders: 394,
+            ..Default::default()
+        });
+        assert_eq!(status, DownloadStatus::Success);
+        assert_eq!(message, None);
+    }
+
+    #[test]
+    fn one_failed_folder_out_of_many_is_partial_not_failed() {
+        let (status, message) = session_status_for(&ReconcileSummary {
+            synced_folders: 393,
+            failed_folders: 1,
+            ..Default::default()
+        });
+        assert_eq!(
+            status,
+            DownloadStatus::Partial,
+            "393/394 folders is not 'all syncs failed'"
+        );
+        let message = message.expect("a partial round must explain itself");
+        assert!(message.contains("393"), "{message}");
+        assert!(message.contains('1'), "{message}");
+    }
+
+    #[test]
+    fn a_round_where_nothing_worked_is_failed() {
+        let (status, _) = session_status_for(&ReconcileSummary {
+            synced_folders: 0,
+            failed_folders: 3,
+            ..Default::default()
+        });
+        assert_eq!(status, DownloadStatus::Failed);
+    }
+
+    #[test]
+    fn throttled_round_is_partial_when_something_synced() {
+        let (status, message) = session_status_for(&ReconcileSummary {
+            synced_folders: 120,
+            failed_folders: 0,
+            throttled: true,
+        });
+        assert_eq!(status, DownloadStatus::Partial);
+        let message = message.expect("a throttled round must explain itself");
+        assert!(message.to_lowercase().contains("throttl"), "{message}");
+    }
+
+    #[test]
+    fn throttled_round_is_failed_when_nothing_synced() {
+        let (status, _) = session_status_for(&ReconcileSummary {
+            synced_folders: 0,
+            throttled: true,
+            ..Default::default()
+        });
+        assert_eq!(status, DownloadStatus::Failed);
+    }
+
+    #[test]
+    fn problem_rounds_never_report_success() {
+        for &(synced, failed, throttled) in &[
+            (0u32, 1u32, false),
+            (10, 1, false),
+            (0, 0, true),
+            (10, 0, true),
+            (10, 5, true),
+        ] {
+            let (status, _) = session_status_for(&ReconcileSummary {
+                synced_folders: synced,
+                failed_folders: failed,
+                throttled,
+            });
+            assert_ne!(
+                status,
+                DownloadStatus::Success,
+                "synced={synced} failed={failed} throttled={throttled}"
+            );
+        }
+    }
 
     #[test]
     fn test_generate_synthetic_uidvalidity_deterministic() {
@@ -1221,6 +1956,124 @@ mod tests {
     fn test_generate_synthetic_uidvalidity_non_zero() {
         let uid = generate_synthetic_uidvalidity("INBOX");
         assert_ne!(uid, 0, "UIDVALIDITY should not be 0 (reserved)");
+    }
+
+    #[tokio::test]
+    async fn test_empty_folder_reconciliation_completes_only_observed_work() {
+        // Reuse upstream's per-process test root; account IDs isolate these cases.
+        let root = crate::test_support::unique_test_root("bichon-core-test");
+        std::env::set_var("BICHON_ROOT_DIR", &root);
+        std::env::set_var("BICHON_ENCRYPT_PASSWORD", "test-password");
+        let _ = &*crate::settings::cli::SETTINGS;
+
+        for (case, existing, cancelled, exists) in [
+            (0, false, false, 0),
+            (1, true, false, 0),
+            (2, false, true, 1),
+            (3, true, true, 1),
+            (4, true, false, 1),
+            (5, false, true, 0),
+            (6, true, true, 0),
+        ] {
+            let account = AccountModel {
+                id: 9_002_011 + case,
+                ..Default::default()
+            };
+            let remote = MailBox {
+                id: account.id,
+                account_id: account.id,
+                name: "Observed".into(),
+                exists,
+                uid_validity: Some(7),
+                ..Default::default()
+            };
+            let local = if existing {
+                vec![MailBox {
+                    highest_uid: Some(42),
+                    ..remote.clone()
+                }]
+            } else {
+                vec![]
+            };
+            DownloadState::init(account.id).await.unwrap();
+            DownloadState::init_folder_details(
+                account.id,
+                vec![remote.name.clone(), "Unvisited".into()],
+            )
+            .unwrap();
+            for (name, status) in [
+                ("Failed", FolderStatus::Failed),
+                ("Cancelled", FolderStatus::Cancelled),
+            ] {
+                DownloadState::update_folder_progress(account.id, name.into(), 0, 0, status, None)
+                    .unwrap();
+            }
+            let token = CancellationToken::new();
+            if cancelled {
+                token.cancel();
+            }
+            // The nonempty failure case has no stored account, so connection
+            // setup fails locally before any network access.
+            let summary = reconcile_mailboxes(&account, &[remote.clone()], &local, token)
+                .await
+                .unwrap();
+            // Since #396 a folder failure is recorded in the summary (which the
+            // caller maps to a Partial/Failed session), not returned as an Err,
+            // so every case returns Ok.
+            assert_eq!(
+                summary.failed_folders,
+                u32::from(exists > 0 && !cancelled),
+                "case {case}"
+            );
+            assert_eq!(
+                summary.synced_folders,
+                u32::from(exists == 0 && !cancelled),
+                "case {case}"
+            );
+            let state = DownloadState::get(account.id).unwrap().unwrap();
+            let session = if cancelled {
+                assert!(state.active_session.is_none());
+                let session = state.history.last().unwrap();
+                assert_eq!(session.status, DownloadStatus::Cancelled);
+                session
+            } else {
+                state.active_session.as_ref().unwrap()
+            };
+            let progress = &session.folder_details[&remote.name];
+            assert_eq!(
+                progress.status,
+                if exists == 0 && !cancelled {
+                    FolderStatus::Success
+                } else {
+                    FolderStatus::Pending
+                },
+                "case {case}, existing={existing}, cancelled={cancelled}"
+            );
+            assert_eq!(
+                (progress.planned, progress.current, &progress.message),
+                (0, 0, &None)
+            );
+            assert_eq!(
+                session.folder_details["Unvisited"].status,
+                FolderStatus::Pending
+            );
+            assert_eq!(
+                session.folder_details["Failed"].status,
+                FolderStatus::Failed
+            );
+            assert_eq!(
+                session.folder_details["Cancelled"].status,
+                FolderStatus::Cancelled
+            );
+            if exists == 0 && !cancelled {
+                assert_eq!(
+                    MailBox::get(remote.id).unwrap().highest_uid,
+                    if existing { Some(42) } else { None }
+                );
+            } else if !cancelled {
+                assert!(!session.errors.is_empty());
+            }
+        }
     }
 
     // ============================================================
@@ -1652,6 +2505,47 @@ mod tests {
         assert_eq!(result.get(&1).unwrap().as_deref(), Some("msg-a@test.com"));
         assert_eq!(result.get(&2).unwrap().as_deref(), Some("msg-b@test.com"));
         assert_eq!(result.get(&3).unwrap().as_deref(), Some("msg-c@test.com"));
+
+        session.logout().await.ok();
+    }
+
+    /// UIDVALIDITY reconciliation fetches full headers: folded and
+    /// lower/upper-case Message-ID headers must still yield an id, otherwise
+    /// the whole mailbox is treated as missing and re-downloaded (#368).
+    #[tokio::test]
+    async fn fetch_uid_metadata_folded_and_case_variant_message_ids() {
+        let folded = b"message-id:\r\n <folded-a@test.example>\r\n\r\n";
+        let upper = b"MESSAGE-ID: <upper-b@test.example>\r\n\r\n";
+        let mut response = Vec::new();
+        for (uid, header) in [(1u32, &folded[..]), (2u32, &upper[..])] {
+            response.extend_from_slice(
+                format!(
+                    "* {uid} FETCH (UID {uid} BODY[HEADER] {{{}}}\r\n",
+                    header.len()
+                )
+                .as_bytes(),
+            );
+            response.extend_from_slice(header);
+            response.extend_from_slice(b")\r\n");
+        }
+        response.extend_from_slice(b"{TAG} OK FETCH completed\r\n");
+
+        let handle = MockImapServer::new()
+            .respond("LOGIN", "{TAG} OK LOGIN done\r\n")
+            .respond("EXAMINE", examine_response("INBOX", 2, 42, 3))
+            .respond("UID FETCH", response)
+            .start()
+            .await;
+
+        let mut session = mock_session(&handle).await;
+
+        let result =
+            ImapExecutor::fetch_uid_metadata(&mut session, "1:2", CancellationToken::new())
+                .await
+                .unwrap();
+
+        assert_eq!(result.get(&1).unwrap().as_deref(), Some("folded-a@test.example"));
+        assert_eq!(result.get(&2).unwrap().as_deref(), Some("upper-b@test.example"));
 
         session.logout().await.ok();
     }

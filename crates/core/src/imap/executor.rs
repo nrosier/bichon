@@ -19,14 +19,15 @@
 use crate::account::migration::AccountModel;
 use crate::account::state::{DownloadState, DownloadStatus, FolderStatus};
 use crate::archive::imap::mailbox::MailBox;
-use crate::envelope::extractor::extract_envelope_and_store_it;
+use crate::envelope::extractor::{extract_envelope_and_store_it, ExtractOutcome};
 use crate::error::code::ErrorCode;
 use crate::imap::session::SessionStream;
 use crate::raise_error;
 use crate::{error::BichonResult, imap::manager::ImapConnectionManager};
-use async_imap::types::Name;
+use async_imap::types::{Mailbox as ImapMailbox, Name};
 use async_imap::Session;
 use futures::TryStreamExt;
+use mail_parser::MessageParser;
 use std::collections::{HashMap, HashSet};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -35,29 +36,217 @@ const BODY_FETCH_COMMAND: &str = "(UID INTERNALDATE RFC822.SIZE BODY.PEEK[])";
 const SIZE_ONLY_FETCH: &str = "(UID RFC822.SIZE)";
 const MAX_NETWORK_RETRIES: u32 = 3;
 
-fn classify_imap_error(e: &async_imap::error::Error) -> ErrorCode {
+/// Whether a tagged `NO`/`BAD` response is the server throttling us rather
+/// than rejecting the command. IMAP has no status code for this, so the
+/// classification is text-based (#396):
+///
+/// * Exchange: `NO [ALERT] Account exceeded command or bandwidth limits. (Failure)`
+/// * Gmail: `NO [LIMIT] Too many simultaneous connections` / `User rate limit exceeded`
+/// * Dovecot: `NO [UNAVAILABLE] Too many connections`
+/// * Generic: `OVERQUOTA`, `service temporarily unavailable`
+///
+/// Matching is case-insensitive. Auth failures must not be swallowed here:
+/// a `NO [AUTHENTICATIONFAILED]` carrying the word "limit" in a banner is
+/// still a credential problem, so callers check auth markers first.
+pub(crate) fn is_throttle_text(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    const NEEDLES: &[&str] = &[
+        "bandwidth limits",
+        "command or bandwidth",
+        "too many simultaneous connections",
+        "too many connections",
+        "user rate limit",
+        "rate limit",
+        "throttl",
+        "overquota",
+        "over quota",
+        "quota exceeded",
+        // Deliberately not the bare "unavailable": Dovecot answers a deleted
+        // mailbox with `[UNAVAILABLE]`, which must not stop the whole round.
+        "temporarily unavailable",
+        "try again later",
+    ];
+    NEEDLES.iter().any(|needle| lower.contains(needle))
+}
+
+/// Whether a `NO`/`BAD` response is a credentials/permission rejection.
+/// Checked before [`is_throttle_text`] so an auth failure that also mentions
+/// a limit is never retried as if the server were merely busy.
+pub(crate) fn is_auth_text(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    const NEEDLES: &[&str] = &[
+        "authenticationfailed",
+        "authentication failed",
+        "invalid credentials",
+        "invalid username",
+        "invalid password",
+        "login failed",
+        "not authenticated",
+        "authorization failed",
+        "access denied",
+        "account disabled",
+        "account is locked",
+    ];
+    NEEDLES.iter().any(|needle| lower.contains(needle))
+}
+
+pub(crate) fn classify_imap_error(e: &async_imap::error::Error) -> ErrorCode {
     match e {
-        async_imap::error::Error::Io(io) => matches!(
-            io.kind(),
-            std::io::ErrorKind::BrokenPipe
-                | std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::ConnectionAborted
-                | std::io::ErrorKind::TimedOut
-                | std::io::ErrorKind::UnexpectedEof
-        )
-        .then_some(ErrorCode::NetworkError)
-        .unwrap_or(ErrorCode::ImapCommandFailed),
+        async_imap::error::Error::Io(io) => classify_io_error(io),
         async_imap::error::Error::ConnectionLost => ErrorCode::NetworkError,
+        async_imap::error::Error::No(text) | async_imap::error::Error::Bad(text) => {
+            if !is_auth_text(text) && is_throttle_text(text) {
+                ErrorCode::ImapServerThrottled
+            } else {
+                ErrorCode::ImapCommandFailed
+            }
+        }
         _ => ErrorCode::ImapCommandFailed,
     }
+}
+
+/// Classifies the failure of a `LOGIN`/`AUTHENTICATE` command.
+///
+/// The same socket/response can mean four very different things, and the
+/// retry policy depends on telling them apart (#396):
+///
+/// * a read timeout or connection reset is a network problem, not a
+///   credential problem (it used to be logged as "password auth failed");
+/// * `NO [ALERT] Account exceeded command or bandwidth limits` is the server
+///   throttling this account — retry later, never storm it;
+/// * `NO [AUTHENTICATIONFAILED]` (or anything unrecognised) is a real login
+///   rejection;
+/// * `BAD` is a protocol/parameter problem.
+pub(crate) fn classify_login_error(e: &async_imap::error::Error) -> ErrorCode {
+    match e {
+        async_imap::error::Error::Io(io) => classify_io_error(io),
+        async_imap::error::Error::ConnectionLost => ErrorCode::NetworkError,
+        async_imap::error::Error::No(text) | async_imap::error::Error::Bad(text) => {
+            if !is_auth_text(text) && is_throttle_text(text) {
+                ErrorCode::ImapServerThrottled
+            } else {
+                ErrorCode::ImapAuthenticationFailed
+            }
+        }
+        // `* BYE` mid-login and unparsable responses are transport-level.
+        async_imap::error::Error::Parse(_) => ErrorCode::NetworkError,
+        _ => ErrorCode::ImapAuthenticationFailed,
+    }
+}
+
+/// How often a silent stream re-reports progress to the caller (and the UI).
+pub(crate) const STALL_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Minimum gap between two *log lines* for one stalled stream.
+///
+/// Progress is re-reported every [`STALL_REPORT_INTERVAL`] so the UI can show
+/// the wait climbing, but logging the same warning every 5 seconds produced
+/// thousands of lines for a single slow server (#396): log at most once a
+/// minute per stream, and at `debug` in between.
+pub(crate) const STALL_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Poll `fut` until it completes, reporting a stall every
+/// [`STALL_REPORT_INTERVAL`] while the server is silent.
+///
+/// The **same** future is polled across timeouts, never rebuilt: dropping an
+/// in-flight IMAP command desynchronizes the session and makes the server
+/// restart the work (#373). Returns `None` when the run is cancelled while the
+/// future is still pending.
+pub(crate) async fn poll_with_stall_reports<F, T>(
+    fut: F,
+    interval: std::time::Duration,
+    token: &CancellationToken,
+    mut on_stall: impl FnMut(u64),
+) -> Option<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    let started = std::time::Instant::now();
+    tokio::pin!(fut);
+    loop {
+        match tokio::time::timeout(interval, &mut fut).await {
+            Ok(value) => return Some(value),
+            Err(_) => {
+                if token.is_cancelled() {
+                    return None;
+                }
+                on_stall(started.elapsed().as_secs());
+            }
+        }
+    }
+}
+
+/// Rate-limits the "server is silent" warning of one stream.
+pub(crate) struct StallLogger {
+    interval: std::time::Duration,
+    /// `None` until the first report, so the first stall is always logged.
+    last: Option<std::time::Instant>,
+}
+
+impl Default for StallLogger {
+    fn default() -> Self {
+        Self::new(STALL_LOG_INTERVAL)
+    }
+}
+
+impl StallLogger {
+    pub(crate) fn new(interval: std::time::Duration) -> Self {
+        Self {
+            interval,
+            last: None,
+        }
+    }
+
+    /// Whether this stall should be logged now, re-arming the window.
+    pub(crate) fn should_log(&mut self, now: std::time::Instant) -> bool {
+        let due = match self.last {
+            None => true,
+            Some(last) => now.duration_since(last) >= self.interval,
+        };
+        if due {
+            self.last = Some(now);
+        }
+        due
+    }
+}
+
+fn classify_io_error(io: &std::io::Error) -> ErrorCode {
+    matches!(
+        io.kind(),
+        std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::NotConnected
+    )
+    .then_some(ErrorCode::NetworkError)
+    .unwrap_or(ErrorCode::ImapCommandFailed)
+}
+
+/// Result of one incremental fetch pass over a mailbox.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FetchOutcome {
+    /// New highest UID, when the pass observed one.
+    pub highest_uid: Option<u32>,
+    /// At least one batch reported repeated stalls. The server is behaving
+    /// like it is throttling us even if it never says so (#396): the caller
+    /// should stop the round and defer the remaining folders instead of
+    /// hammering it folder after folder.
+    pub stalled: bool,
 }
 
 /// The outcome of one batched body fetch ([`ImapExecutor::uid_batch_retrieve_emails`]).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct BatchFetchOutcome {
-    /// Messages actually stored. Parse-skipped and oversized messages are
-    /// not included.
+    /// Messages processed by this batch (fetched and run through extraction).
+    /// Includes duplicates and messages dropped by archive rules, so callers
+    /// can use it to advance a progress counter. Parse-skipped and oversized
+    /// messages are not included.
     pub stored: u64,
+    /// The subset of `stored` that the account's archive rules rejected. They
+    /// were processed but never archived.
+    pub filtered: u64,
     /// The server looked like it was rate-limiting (consecutive stall
     /// reports); callers back off before the next batch.
     pub throttled: bool,
@@ -70,6 +259,54 @@ pub struct BatchFetchOutcome {
 pub struct ImapExecutor;
 
 impl ImapExecutor {
+    /// Read mailbox metadata without modifying messages. Some servers (notably
+    /// Tencent Enterprise Mail) reply to STATUS using a different mailbox alias
+    /// than LIST. async-imap discards that response and returns default metadata,
+    /// so an apparent empty mailbox with missing identifiers needs verification.
+    pub async fn mailbox_metadata(
+        session: &mut Session<Box<dyn SessionStream>>,
+        mailbox_name: &str,
+    ) -> BichonResult<ImapMailbox> {
+        let status = session
+            .status(mailbox_name, "(MESSAGES UNSEEN UIDNEXT UIDVALIDITY)")
+            .await
+            .map_err(|e| {
+                raise_error!(
+                    format!("STATUS failed for mailbox {mailbox_name:?}: {e:#?}"),
+                    classify_imap_error(&e)
+                )
+            })?;
+
+        if status.uid_validity.is_some_and(|uid| uid != 0)
+            && status.uid_next.is_some_and(|uid| uid != 0)
+        {
+            return Ok(status);
+        }
+
+        let mut examined = session.examine(mailbox_name).await.map_err(|e| {
+            raise_error!(
+                format!("EXAMINE failed for mailbox {mailbox_name:?}: {e:#?}"),
+                classify_imap_error(&e)
+            )
+        })?;
+        if !examined.uid_validity.is_some_and(|uid| uid != 0) {
+            return Err(raise_error!(
+                format!(
+                    "Cannot read trustworthy metadata for mailbox {mailbox_name:?}: \
+                     EXAMINE returned no valid UIDVALIDITY after an incomplete STATUS response"
+                ),
+                ErrorCode::ImapUnexpectedResult
+            ));
+        }
+
+        // EXAMINE's UNSEEN is the first unseen sequence number, not a count.
+        // Keep the STATUS count when available; otherwise leave it unknown.
+        examined.unseen = status.unseen;
+        // UIDNEXT can remain absent: sync already supports servers without it.
+        examined.uid_next = examined.uid_next.filter(|&uid| uid != 0);
+        Ok(examined)
+    }
+
     pub async fn list_all_mailboxes(
         session: &mut Session<Box<dyn SessionStream>>,
     ) -> BichonResult<Vec<Name>> {
@@ -155,7 +392,7 @@ impl ImapExecutor {
         start_uid: u64,
         before: Option<&str>,
         token: CancellationToken,
-    ) -> BichonResult<Option<u32>> {
+    ) -> BichonResult<FetchOutcome> {
         assert!(start_uid > 0, "start_uid must be greater than 0");
 
         let examined = session
@@ -194,7 +431,8 @@ impl ImapExecutor {
         date: &str,
         examined: async_imap::types::Mailbox,
         token: CancellationToken,
-    ) -> BichonResult<Option<u32>> {
+    ) -> BichonResult<FetchOutcome> {
+        let mut stalled = false;
         let uid_range = format!("{start_uid}:*");
         let (entries, skipped_oversized) = Self::collect_range_uids(
             session,
@@ -229,30 +467,37 @@ impl ImapExecutor {
             // existed but was all oversized (skipped_oversized > 0), or all
             // entries fell outside the date window (entries non-empty).
             if skipped_oversized == 0 && entries.is_empty() {
-                if let Some(msg) = empty_enumeration_anomaly(
-                    mailbox.name.as_str(),
+                match Self::guard_empty_enumeration(
+                    session,
+                    account,
+                    mailbox,
                     &uid_range,
                     start_uid,
                     examined.uid_next,
-                ) {
-                    tracing::info!(
-                        account_id = account.id,
-                        mailbox = %mailbox.name,
-                        start_uid,
-                        uid_next = examined.uid_next,
-                        "{}",
-                        msg
-                    );
-                    //DownloadState::append_session_error(account.id, msg)?;
-                    DownloadState::update_folder_progress(
-                        account.id,
-                        mailbox.name.clone(),
-                        0,
-                        0,
-                        FolderStatus::Success,
-                        Some("UID FETCH range returned empty; tail UIDs appear to have been purged. highest_uid unchanged, will retry on next sync.".into()),
-                    )?;
-                    return Ok(None);
+                )
+                .await?
+                {
+                    EmptyEnumeration::NotAnomaly => {}
+                    EmptyEnumeration::Advanced(new_highest) => {
+                        return Ok(FetchOutcome {
+                            highest_uid: Some(new_highest),
+                            stalled,
+                        })
+                    }
+                    EmptyEnumeration::KeepWatermark => {
+                        DownloadState::update_folder_progress(
+                            account.id,
+                            mailbox.name.clone(),
+                            0,
+                            0,
+                            FolderStatus::Success,
+                            Some("UID FETCH range returned empty; tail UIDs may have been purged. highest_uid unchanged, will retry on next sync.".into()),
+                        )?;
+                        return Ok(FetchOutcome {
+                            highest_uid: None,
+                            stalled,
+                        });
+                    }
                 }
             }
             DownloadState::update_folder_progress(
@@ -263,7 +508,10 @@ impl ImapExecutor {
                 FolderStatus::Success,
                 Some("No new emails found.".into()),
             )?;
-            return Ok(None);
+            return Ok(FetchOutcome {
+                highest_uid: None,
+                stalled,
+            });
         }
 
         let max_uid = uid_vec.last().copied();
@@ -281,6 +529,7 @@ impl ImapExecutor {
         )?;
 
         let mut count = 0u64;
+        let mut filtered = 0u64;
         for batch in uid_batches {
             if token.is_cancelled() {
                 DownloadState::update_session_status(
@@ -308,7 +557,7 @@ impl ImapExecutor {
                 &batch.0,
                 account.max_email_size_bytes,
                 token.clone(),
-                Some(&|cumulative, avg_secs, stall_secs| {
+                Some(&|cumulative, _cumulative_filtered, avg_secs, stall_secs| {
                     // Per-message progress: the current batch's cumulative count
                     // keeps the UI moving while a slow server trickles messages.
                     let _ = DownloadState::update_folder_progress(
@@ -326,17 +575,27 @@ impl ImapExecutor {
             if outcome.throttled {
                 // Server appears to be rate-limiting; back off before the next
                 // batch so we don't hammer the limiter with back-to-back bursts.
+                // The caller stops the round on `stalled`.
+                stalled = true;
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
             count += outcome.stored;
-            DownloadState::update_folder_progress(
+            filtered += outcome.filtered;
+            DownloadState::update_folder_progress_and_filtered(
                 account.id,
                 mailbox.name.clone(),
                 planned,
                 count,
+                filtered,
                 FolderStatus::Downloading,
                 None,
             )?;
+            // Resume cursor: this batch is fully processed, and every UID of a
+            // later batch is greater than this batch's maximum (the list was
+            // sorted before batching). Persisting it here means a throttled or
+            // broken round resumes at the last completed batch instead of
+            // re-downloading the whole range.
+            MailBox::advance_watermark(mailbox.id, batch.2)?;
         }
 
         DownloadState::update_folder_progress(
@@ -348,7 +607,10 @@ impl ImapExecutor {
             None,
         )?;
 
-        Ok(max_uid)
+        Ok(FetchOutcome {
+            highest_uid: max_uid,
+            stalled,
+        })
     }
 
     /// Enumerates every UID in `{start}:*` via a lightweight
@@ -423,6 +685,110 @@ impl ImapExecutor {
         Ok((entries, skipped_oversized))
     }
 
+    /// Re-checks an empty enumeration with the *closed* range
+    /// `[start_uid, uid_next - 1]` and returns the UIDs the server reports.
+    ///
+    /// Used only when the anomaly guard fires. `UID FETCH start:*` can be
+    /// empty both when the tail was expunged and when the server dropped the
+    /// response; the closed interval is re-asked with `UID FETCH`, which
+    /// RFC 3501 §6.4.4 requires to return the full interval, so an empty
+    /// answer is trustworthy evidence that no message exists there.
+    async fn probe_range_uids(
+        session: &mut Session<Box<dyn SessionStream>>,
+        start_uid: u64,
+        uid_next: u32,
+    ) -> BichonResult<Vec<u32>> {
+        let range = format!("{}:{}", start_uid, uid_next.saturating_sub(1));
+        let mut stream = session.uid_fetch(&range, "(UID)").await.map_err(|e| {
+            raise_error!(format!("{:#?}", e), classify_imap_error(&e))
+        })?;
+        let mut uids = Vec::new();
+        while let Some(item) = stream
+            .try_next()
+            .await
+            .map_err(|e| raise_error!(format!("{:#?}", e), classify_imap_error(&e)))?
+        {
+            if let Some(uid) = item.uid {
+                uids.push(uid);
+            }
+        }
+        Ok(uids)
+    }
+
+    /// Applies the empty-enumeration guard to a ranged fetch that returned no
+    /// UIDs although the server reports `UIDNEXT` past the watermark.
+    ///
+    /// The guard exists so a truncated response cannot silently skip mail. It
+    /// used to always keep the watermark, which meant a mailbox whose tail had
+    /// been *deleted* (Exchange keeps `UIDNEXT` across deletes) re-enumerated
+    /// the same empty range on every round, forever (#396). The closed range is
+    /// re-checked once; only a proven-empty interval advances the watermark.
+    async fn guard_empty_enumeration(
+        session: &mut Session<Box<dyn SessionStream>>,
+        account: &AccountModel,
+        mailbox: &MailBox,
+        uid_range: &str,
+        start_uid: u64,
+        uid_next: Option<u32>,
+    ) -> BichonResult<EmptyEnumeration> {
+        let Some(msg) =
+            empty_enumeration_anomaly(mailbox.name.as_str(), uid_range, start_uid, uid_next)
+        else {
+            return Ok(EmptyEnumeration::NotAnomaly);
+        };
+        tracing::info!(
+            account_id = account.id,
+            mailbox = %mailbox.name,
+            start_uid,
+            uid_next,
+            "{}",
+            msg
+        );
+
+        let Some(next) = uid_next else {
+            return Ok(EmptyEnumeration::KeepWatermark);
+        };
+        match Self::probe_range_uids(session, start_uid, next).await {
+            Ok(probe) => match empty_range_resolution(start_uid, uid_next, &probe) {
+                EmptyRangeAction::Advance(new_highest) => {
+                    tracing::info!(
+                        account_id = account.id,
+                        mailbox = %mailbox.name,
+                        start_uid,
+                        uid_next,
+                        new_highest,
+                        "empty UID range is final: the tail UIDs were expunged on the server; advancing highest_uid"
+                    );
+                    DownloadState::update_folder_progress(
+                        account.id,
+                        mailbox.name.clone(),
+                        0,
+                        0,
+                        FolderStatus::Success,
+                        Some(format!(
+                            "UID FETCH range returned empty and the server has no message in it; \
+                             tail UIDs were expunged. highest_uid advanced to {}.",
+                            new_highest
+                        )),
+                    )?;
+                    Ok(EmptyEnumeration::Advanced(new_highest))
+                }
+                _ => Ok(EmptyEnumeration::KeepWatermark),
+            },
+            // A probe failure (network/throttle) must not advance the
+            // watermark; keeping it is the conservative outcome.
+            Err(e) => {
+                tracing::warn!(
+                    account_id = account.id,
+                    mailbox = %mailbox.name,
+                    error = %e,
+                    "empty-range probe failed; keeping highest_uid and retrying next sync"
+                );
+                Ok(EmptyEnumeration::KeepWatermark)
+            }
+        }
+    }
+
     /// Fetches all messages with UID >= start_uid via batched UID FETCH.
     ///
     /// A single ranged `UID FETCH {start}:* (BODY[])` can block for minutes on
@@ -450,7 +816,8 @@ impl ImapExecutor {
         start_uid: u64,
         examined: async_imap::types::Mailbox,
         token: CancellationToken,
-    ) -> BichonResult<Option<u32>> {
+    ) -> BichonResult<FetchOutcome> {
+        let mut stalled = false;
         let uid_range = format!("{start_uid}:*");
         info!(
             "[account {}][mailbox {}] fetch_new_mail: enumerate UIDs via UID FETCH {}",
@@ -498,33 +865,41 @@ impl ImapExecutor {
             // size limit), so skip the anomaly check when the size filter (not
             // the server) is what emptied the range.
             if skipped_oversized == 0 {
-                if let Some(msg) = empty_enumeration_anomaly(
-                    mailbox.name.as_str(),
+                match Self::guard_empty_enumeration(
+                    session,
+                    account,
+                    mailbox,
                     &uid_range,
                     start_uid,
                     examined.uid_next,
-                ) {
-                    tracing::info!(
-                        account_id = account.id,
-                        mailbox = %mailbox.name,
-                        start_uid,
-                        uid_next = examined.uid_next,
-                        "{}",
-                        msg
-                    );
-                    //The gap between highest_uid and uid_next may be caused by messages being deleted on the server side.
-                    //Reporting this as a warning/error makes users think that something is wrong with the sync.
-
-                    //DownloadState::append_session_error(account.id, msg)?;
-                    DownloadState::update_folder_progress(
-                        account.id,
-                        mailbox.name.clone(),
-                        0,
-                        0,
-                        FolderStatus::Success,
-                        Some("UID FETCH range returned empty; tail UIDs appear to have been purged. highest_uid unchanged, will retry on next sync.".into()),
-                    )?;
-                    return Ok(None);
+                )
+                .await?
+                {
+                    EmptyEnumeration::NotAnomaly => {}
+                    EmptyEnumeration::Advanced(new_highest) => {
+                        return Ok(FetchOutcome {
+                            highest_uid: Some(new_highest),
+                            stalled,
+                        })
+                    }
+                    EmptyEnumeration::KeepWatermark => {
+                        // The gap between highest_uid and uid_next may be
+                        // caused by messages being deleted on the server side.
+                        // Reporting this as a warning/error makes users think
+                        // something is wrong with the sync.
+                        DownloadState::update_folder_progress(
+                            account.id,
+                            mailbox.name.clone(),
+                            0,
+                            0,
+                            FolderStatus::Success,
+                            Some("UID FETCH range returned empty; tail UIDs may have been purged. highest_uid unchanged, will retry on next sync.".into()),
+                        )?;
+                        return Ok(FetchOutcome {
+                            highest_uid: None,
+                            stalled,
+                        });
+                    }
                 }
             }
             DownloadState::update_folder_progress(
@@ -535,7 +910,10 @@ impl ImapExecutor {
                 FolderStatus::Success,
                 Some("No new emails found.".into()),
             )?;
-            return Ok(None);
+            return Ok(FetchOutcome {
+                highest_uid: None,
+                stalled,
+            });
         }
 
         let max_uid = uid_vec.last().copied();
@@ -554,6 +932,7 @@ impl ImapExecutor {
         )?;
 
         let mut count = 0u64;
+        let mut filtered = 0u64;
         for (index, batch) in batches.into_iter().enumerate() {
             if token.is_cancelled() {
                 DownloadState::update_session_status(
@@ -579,7 +958,7 @@ impl ImapExecutor {
                     &batch.0,
                     account.max_email_size_bytes,
                     token.clone(),
-                    Some(&|cumulative, avg_secs, stall_secs| {
+                    Some(&|cumulative, _cumulative_filtered, avg_secs, stall_secs| {
                         // Report per-message so the UI moves even while a slow
                         // server trickles out the current batch.
                         DownloadState::update_folder_progress(
@@ -644,15 +1023,27 @@ impl ImapExecutor {
             };
             match batch_result {
                 Ok(outcome) => {
+                    if outcome.throttled {
+                        // Repeated stalls: back off before the next batch, and
+                        // let the caller defer the remaining folders.
+                        stalled = true;
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    }
                     count += outcome.stored;
-                    DownloadState::update_folder_progress(
+                    filtered += outcome.filtered;
+                    DownloadState::update_folder_progress_and_filtered(
                         account.id,
                         mailbox.name.clone(),
                         planned,
                         count,
+                        filtered,
                         FolderStatus::Downloading,
                         None,
                     )?;
+                    // Resume cursor, as in `fetch_new_mail_with_before`: the
+                    // batch is fully processed and no later batch contains a
+                    // smaller UID, so an interrupted round resumes here.
+                    MailBox::advance_watermark(mailbox.id, batch.2)?;
                     tracing::debug!(
                         "[account {}][mailbox {}] fetch_new_mail: batch {}/{} done ({} processed)",
                         account.id,
@@ -681,7 +1072,10 @@ impl ImapExecutor {
             None,
         )?;
 
-        Ok(max_uid)
+        Ok(FetchOutcome {
+            highest_uid: max_uid,
+            stalled,
+        })
     }
 
     /// Downloads the bodies of `uid_set` in one batch.
@@ -707,8 +1101,9 @@ impl ImapExecutor {
         uid_set: &str,
         max_email_size_bytes: Option<u64>,
         token: CancellationToken,
+        // (processed, filtered-by-archive-rules, avg_secs, stall_secs)
         progress: Option<
-            &(dyn Fn(u64, Option<f64>, Option<f64>) -> BichonResult<()> + Send + Sync),
+            &(dyn Fn(u64, u64, Option<f64>, Option<f64>) -> BichonResult<()> + Send + Sync),
         >,
     ) -> BichonResult<BatchFetchOutcome> {
         let limit = max_email_size_bytes.unwrap_or(DEFAULT_MAX_EMAIL_SIZE);
@@ -749,13 +1144,17 @@ impl ImapExecutor {
         }
 
         // PASS 2: fetch bodies only for acceptable UIDs
-        let filtered = compress_uid_list(acceptable_uids);
+        let uid_set = compress_uid_list(acceptable_uids);
         let mut body_stream = session
-            .uid_fetch(&filtered, BODY_FETCH_COMMAND)
+            .uid_fetch(&uid_set, BODY_FETCH_COMMAND)
             .await
             .map_err(|e| raise_error!(format!("{:#?}", e), classify_imap_error(&e)))?;
 
         let mut count = 0u64;
+        // Messages dropped by the account's archive rules. Counted as
+        // processed (they were fetched) but reported separately so the sync
+        // state can show what the filter kept out.
+        let mut filtered = 0u64;
         // Messages skipped because their body could not be parsed (not
         // archived). Reported through the outcome so callers can surface a
         // folder-level warning and count them as failed where appropriate.
@@ -772,7 +1171,6 @@ impl ImapExecutor {
         // While the server is silent, re-report the current wait every few
         // seconds so the UI shows the wait climbing instead of a stale
         // average (the average only moves when a message actually arrives).
-        const STALL_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
         loop {
             // On error, report the number of emails already stored through the
             // progress callback so a partial batch is not counted as fully
@@ -784,7 +1182,7 @@ impl ImapExecutor {
                     Err(_) => {
                         if token.is_cancelled() {
                             if let Some(progress) = progress {
-                                let _ = progress(count, None, None);
+                                let _ = progress(count, filtered, None, None);
                             }
                             return Err(raise_error!(
                                 "Stream cancelled".into(),
@@ -795,7 +1193,7 @@ impl ImapExecutor {
                         consecutive_stalls += 1;
 
                         if let Some(progress) = progress {
-                            progress(count, None, Some(stall_secs))?;
+                            progress(count, filtered, None, Some(stall_secs))?;
                         }
                         continue;
                     }
@@ -804,7 +1202,7 @@ impl ImapExecutor {
                 Ok(item) => item,
                 Err((processed, e)) => {
                     if let Some(progress) = progress {
-                        let _ = progress(processed, None, None);
+                        let _ = progress(processed, filtered, None, None);
                     }
                     return Err(raise_error!(format!("{:#?}", e), classify_imap_error(&e)));
                 }
@@ -814,7 +1212,7 @@ impl ImapExecutor {
             if token.is_cancelled() {
                 tracing::info!("Account {}: UID fetch stream interrupted.", account_id);
                 if let Some(progress) = progress {
-                    let _ = progress(count, None, None);
+                    let _ = progress(count, filtered, None, None);
                 }
                 return Err(raise_error!(
                     "Stream cancelled".into(),
@@ -841,7 +1239,10 @@ impl ImapExecutor {
             // the skip-warning below can name the message.
             let fetch_uid = fetch.uid.unwrap_or(0);
             match extract_envelope_and_store_it(fetch, account_id, mailbox_id).await {
-                Ok(()) => {}
+                Ok(ExtractOutcome::Filtered) => {
+                    filtered += 1;
+                }
+                Ok(_) => {}
                 Err(e) if e.code() == ErrorCode::EmailParseError => {
                     // One broken message must not abort the batch (#377): it is
                     // not stored, the stream keeps going, and the running state
@@ -866,18 +1267,19 @@ impl ImapExecutor {
                 }
                 Err(e) => {
                     if let Some(progress) = progress {
-                        let _ = progress(count, None, None);
+                        let _ = progress(count, filtered, None, None);
                     }
                     return Err(e);
                 }
             }
             count += 1;
             if let Some(progress) = progress {
-                progress(count, avg_secs, None)?;
+                progress(count, filtered, avg_secs, None)?;
             }
         }
         Ok(BatchFetchOutcome {
             stored: count,
+            filtered,
             throttled: consecutive_stalls >= 2,
             parse_skipped,
         })
@@ -941,6 +1343,154 @@ impl ImapExecutor {
         ImapConnectionManager::build(account_id).await
     }
 
+    /// Whether the server advertises `MOVE` (RFC 6851).
+    ///
+    /// Source-mailbox cleanup requires it: MOVE is the only way to take a
+    /// message out of a source folder without Bichon ever issuing `EXPUNGE`.
+    /// The check is live — `capabilities()` issues a fresh `CAPABILITY`
+    /// command on this authenticated connection, so post-login capabilities
+    /// are what gets judged.
+    pub async fn supports_move(
+        session: &mut Session<Box<dyn SessionStream>>,
+    ) -> BichonResult<bool> {
+        let caps = crate::imap::capabilities::fetch_capabilities(session).await?;
+        Ok(crate::imap::capabilities::has_capability(&caps, "MOVE"))
+    }
+
+    /// Select a mailbox read-write (moves need a writable selection).
+    pub async fn select_mailbox(
+        session: &mut Session<Box<dyn SessionStream>>,
+        mailbox_name: &str,
+    ) -> BichonResult<u32> {
+        let mailbox = session
+            .select(mailbox_name)
+            .await
+            .map_err(|e| raise_error!(format!("{:#?}", e), classify_imap_error(&e)))?;
+        Ok(mailbox.uid_validity.unwrap_or(0))
+    }
+
+    /// Examine a mailbox read-only and return its UIDVALIDITY.
+    pub async fn examine_mailbox(
+        session: &mut Session<Box<dyn SessionStream>>,
+        mailbox_name: &str,
+    ) -> BichonResult<u32> {
+        let mailbox = session
+            .examine(mailbox_name)
+            .await
+            .map_err(|e| raise_error!(format!("{:#?}", e), classify_imap_error(&e)))?;
+        Ok(mailbox.uid_validity.unwrap_or(0))
+    }
+
+    pub async fn create_mailbox(
+        session: &mut Session<Box<dyn SessionStream>>,
+        mailbox_name: &str,
+    ) -> BichonResult<()> {
+        session
+            .create(mailbox_name)
+            .await
+            .map_err(|e| raise_error!(format!("{:#?}", e), classify_imap_error(&e)))
+    }
+
+    /// Case-insensitive existence check against the server's LIST result.
+    pub async fn mailbox_exists(
+        session: &mut Session<Box<dyn SessionStream>>,
+        mailbox_name: &str,
+    ) -> BichonResult<bool> {
+        let mailboxes = Self::list_all_mailboxes(session).await?;
+        Ok(mailboxes
+            .iter()
+            .any(|name| name.name().eq_ignore_ascii_case(mailbox_name)))
+    }
+
+    /// Whether one UID currently carries `\Flagged`. Examines the mailbox, so
+    /// the caller must select the source folder again afterwards.
+    pub async fn uid_is_flagged(
+        session: &mut Session<Box<dyn SessionStream>>,
+        mailbox_name: &str,
+        uid: u32,
+    ) -> BichonResult<bool> {
+        session
+            .examine(mailbox_name)
+            .await
+            .map_err(|e| raise_error!(format!("{:#?}", e), classify_imap_error(&e)))?;
+        let mut stream = session
+            .uid_fetch(uid.to_string(), "(UID FLAGS)")
+            .await
+            .map_err(|e| raise_error!(format!("{:#?}", e), classify_imap_error(&e)))?;
+        while let Some(fetch) = stream
+            .try_next()
+            .await
+            .map_err(|e| raise_error!(format!("{:#?}", e), classify_imap_error(&e)))?
+        {
+            if fetch.uid == Some(uid) {
+                return Ok(fetch
+                    .flags()
+                    .any(|flag| matches!(flag, async_imap::types::Flag::Flagged)));
+            }
+        }
+        Ok(false)
+    }
+
+    /// Fetch the subset of `uid_set` that currently carries `\Flagged`.
+    /// The caller must have selected or examined the mailbox.
+    pub async fn fetch_flagged_uids(
+        session: &mut Session<Box<dyn SessionStream>>,
+        uid_set: &str,
+    ) -> BichonResult<std::collections::HashSet<u32>> {
+        let mut stream = session
+            .uid_fetch(uid_set, "(UID FLAGS)")
+            .await
+            .map_err(|e| raise_error!(format!("{:#?}", e), classify_imap_error(&e)))?;
+        let mut flagged = std::collections::HashSet::new();
+        while let Some(fetch) = stream
+            .try_next()
+            .await
+            .map_err(|e| raise_error!(format!("{:#?}", e), classify_imap_error(&e)))?
+        {
+            if let Some(uid) = fetch.uid {
+                if fetch
+                    .flags()
+                    .any(|flag| matches!(flag, async_imap::types::Flag::Flagged))
+                {
+                    flagged.insert(uid);
+                }
+            }
+        }
+        Ok(flagged)
+    }
+
+    /// `UID MOVE` (RFC 6851). The only move primitive Bichon uses: a move is
+    /// atomic on the server and requires no EXPUNGE anywhere.
+    pub async fn uid_mv(
+        session: &mut Session<Box<dyn SessionStream>>,
+        uid_set: &str,
+        destination: &str,
+    ) -> BichonResult<()> {
+        session
+            .uid_mv(uid_set, destination)
+            .await
+            .map_err(|e| raise_error!(format!("{:#?}", e), classify_imap_error(&e)))
+    }
+
+    /// Read-only UID SEARCH in a specific mailbox.
+    pub async fn uid_search_in(
+        session: &mut Session<Box<dyn SessionStream>>,
+        mailbox_name: &str,
+        query: &str,
+    ) -> BichonResult<Vec<u32>> {
+        session
+            .examine(mailbox_name)
+            .await
+            .map_err(|e| raise_error!(format!("{:#?}", e), classify_imap_error(&e)))?;
+        let found = session
+            .uid_search(query)
+            .await
+            .map_err(|e| raise_error!(format!("{:#?}", e), classify_imap_error(&e)))?;
+        let mut uids: Vec<u32> = found.into_iter().collect();
+        uids.sort();
+        Ok(uids)
+    }
+
     /// Fetch UID → Message-ID mapping without downloading bodies.
     /// `uid_set` is an IMAP sequence-set string (e.g. "1:100" or "1,3,5").
     pub async fn fetch_uid_metadata(
@@ -968,6 +1518,39 @@ impl ImapExecutor {
             let uid = fetch.uid.unwrap_or(0);
             let msg_id = fetch.header().and_then(parse_message_id_header);
             result.insert(uid, msg_id);
+        }
+        Ok(result)
+    }
+
+    /// Fetch raw header blocks for a UID sequence-set, without bodies.
+    ///
+    /// Used by gap-fill to apply archive rules to missing candidates before
+    /// deciding whether their bodies are worth downloading.
+    pub async fn fetch_uid_header_blocks(
+        session: &mut Session<Box<dyn SessionStream>>,
+        uid_set: &str,
+        token: CancellationToken,
+    ) -> BichonResult<Vec<(u32, Vec<u8>)>> {
+        let mut stream = session
+            .uid_fetch(uid_set, "(UID BODY.PEEK[HEADER])")
+            .await
+            .map_err(|e| raise_error!(format!("{:#?}", e), classify_imap_error(&e)))?;
+
+        let mut result = Vec::new();
+        while let Some(fetch) = stream
+            .try_next()
+            .await
+            .map_err(|e| raise_error!(format!("{:#?}", e), classify_imap_error(&e)))?
+        {
+            if token.is_cancelled() {
+                return Err(raise_error!(
+                    "Stream cancelled".into(),
+                    ErrorCode::InternalError
+                ));
+            }
+            let uid = fetch.uid.unwrap_or(0);
+            let header = fetch.header().map(|h| h.to_vec()).unwrap_or_default();
+            result.push((uid, header));
         }
         Ok(result)
     }
@@ -1004,7 +1587,8 @@ impl ImapExecutor {
         let mut last_recv = std::time::Instant::now();
         // While the server is silent, re-report the current count every few
         // seconds so the UI shows the wait climbing instead of a stale state.
-        const STALL_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+        // The log line is rate-limited separately (see `StallLogger`).
+        let mut stall_logger = StallLogger::default();
         loop {
             let item = match tokio::time::timeout(STALL_REPORT_INTERVAL, stream.try_next()).await {
                 Ok(Ok(item)) => Ok(item),
@@ -1020,11 +1604,19 @@ impl ImapExecutor {
                     if let Some(progress) = progress {
                         progress(result.len() as u64, Some(stall_secs))?;
                     }
-                    tracing::warn!(
-                        stall_secs = format!("{:.0}", stall_secs),
-                        fetched = result.len(),
-                        "fetch_uid_headers: server silent, waiting"
-                    );
+                    if stall_logger.should_log(std::time::Instant::now()) {
+                        tracing::warn!(
+                            stall_secs = format!("{:.0}", stall_secs),
+                            fetched = result.len(),
+                            "fetch_uid_headers: server silent, waiting"
+                        );
+                    } else {
+                        tracing::debug!(
+                            stall_secs = format!("{:.0}", stall_secs),
+                            fetched = result.len(),
+                            "fetch_uid_headers: server silent, still waiting"
+                        );
+                    }
                     continue;
                 }
             };
@@ -1144,11 +1736,19 @@ pub fn compress_uid_list(nums: Vec<u32>) -> String {
 }
 
 /// Splits a sorted list of unique UIDs into compressed sequence-set batches.
-/// Returns `Vec<(sequence_set_string, batch_count)>`.
+/// Returns `Vec<(sequence_set_string, batch_count, highest_uid_in_batch)>`.
+///
+/// The input MUST be sorted ascending — every caller sorts the UID list before
+/// calling. The chunks are slices of that one ascending list, so every UID of a
+/// later batch is greater than every UID of an earlier one. That is what makes
+/// the batch maximum a safe resume cursor: after a fully processed batch the
+/// download loops persist it as the folder's watermark
+/// (`MailBox::advance_watermark`), so an interrupted round resumes at the last
+/// completed batch instead of re-downloading the whole range.
 pub fn generate_uid_sequence_hashset(
     unique_nums: Vec<u32>,
     chunk_size: usize,
-) -> Vec<(String, u64)> {
+) -> Vec<(String, u64, u32)> {
     assert!(!unique_nums.is_empty());
 
     let mut result = Vec::new();
@@ -1156,8 +1756,10 @@ pub fn generate_uid_sequence_hashset(
 
     for chunk in nums.chunks(chunk_size) {
         let size = chunk.len() as u64;
+        // Never empty: `chunks` only yields non-empty slices.
+        let highest_uid = *chunk.last().expect("chunk is non-empty");
         let compressed = compress_uid_list(chunk.to_vec());
-        result.push((compressed, size));
+        result.push((compressed, size, highest_uid));
     }
 
     result
@@ -1212,25 +1814,71 @@ fn empty_enumeration_anomaly(
     }
 }
 
-fn parse_message_id_header(header_bytes: &[u8]) -> Option<String> {
-    let header = std::str::from_utf8(header_bytes).ok()?;
-    for line in header.lines() {
-        if let Some(value) = line
-            .strip_prefix("Message-ID:")
-            .or_else(|| line.strip_prefix("Message-Id:"))
-            .or_else(|| line.strip_prefix("Message-id:"))
-        {
-            // mail_parser strips angle brackets, so we must do the same
-            // to ensure comparisons against the Tantivy index match.
-            let trimmed = value.trim();
-            let stripped = trimmed.strip_prefix('<').unwrap_or(trimmed);
-            let stripped = stripped.strip_suffix('>').unwrap_or(stripped);
-            if !stripped.is_empty() {
-                return Some(stripped.to_string());
-            }
-        }
+/// What to do when the ranged enumeration came back empty although the server
+/// reports `UIDNEXT > start_uid`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EmptyRangeAction {
+    /// `UIDNEXT` did not pass the watermark: legitimate "no new mail".
+    Nothing,
+    /// No UID exists in `[start_uid, uid_next - 1]`, so the tail was expunged
+    /// on the server (Exchange keeps `UIDNEXT` after a delete). The watermark
+    /// may safely move to this value; otherwise the folder re-enumerates the
+    /// same empty range forever (#396: 42 folders, every round).
+    Advance(u32),
+    /// Something in the range does exist, so the first fetch was truncated or
+    /// dropped: keep the watermark and retry on the next sync.
+    Retry,
+}
+
+/// Outcome of [`ImapExecutor::guard_empty_enumeration`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EmptyEnumeration {
+    /// `UIDNEXT` did not pass the watermark: nothing to do.
+    NotAnomaly,
+    /// Keep the watermark and retry on the next sync.
+    KeepWatermark,
+    /// The tail was proven expunged; advance the watermark to this value.
+    Advanced(u32),
+}
+
+/// Decides [`EmptyRangeAction`] from a re-check of the closed interval
+/// `[start_uid, uid_next - 1]`.
+///
+/// The re-check uses `UID FETCH` (not `UID SEARCH`, which RFC 3501 lets a
+/// server answer with a subset) so an empty answer is authoritative.
+fn empty_range_resolution(
+    start_uid: u64,
+    server_uid_next: Option<u32>,
+    probe_uids: &[u32],
+) -> EmptyRangeAction {
+    let Some(uid_next) = server_uid_next else {
+        return EmptyRangeAction::Nothing;
+    };
+    if (uid_next as u64) <= start_uid {
+        return EmptyRangeAction::Nothing;
     }
-    None
+    if probe_uids.iter().any(|&uid| (uid as u64) >= start_uid) {
+        return EmptyRangeAction::Retry;
+    }
+    EmptyRangeAction::Advance(uid_next - 1)
+}
+
+/// Extracts the Message-ID from a raw header block fetched over IMAP.
+///
+/// The value is compared against the Tantivy index, where it was produced by
+/// `mail_parser` when the message was archived (`envelope::extractor`), so it
+/// must be parsed the same way: folding, header-name case, comments and angle
+/// brackets all have to match. A hand-rolled prefix scan used to diverge here,
+/// so gap-fill treated folded or lower-case `Message-ID` headers as missing and
+/// re-downloaded archived mail (#368).
+fn parse_message_id_header(header_bytes: &[u8]) -> Option<String> {
+    if header_bytes.is_empty() {
+        return None;
+    }
+    MessageParser::default()
+        .parse_headers(header_bytes)
+        .and_then(|message| message.message_id().map(str::to_string))
+        .filter(|id| !id.is_empty())
 }
 
 #[cfg(test)]
@@ -1238,6 +1886,82 @@ mod test {
     use super::*;
     use crate::imap::session::SessionStream;
     use tokio_io_timeout::TimeoutStream;
+
+    // ── stall logging & polling ────────────────────────────────────
+
+    /// The first stall is logged; repeats are rate-limited to one per window
+    /// so a slow server cannot flood the log (#396: 9,529 lines in one run).
+    #[test]
+    fn stall_logger_rate_limits_repeats() {
+        let base = std::time::Instant::now();
+        let mut logger = StallLogger::new(std::time::Duration::from_secs(60));
+        assert!(logger.should_log(base), "the first stall is reported");
+        assert!(!logger.should_log(base + std::time::Duration::from_secs(5)));
+        assert!(!logger.should_log(base + std::time::Duration::from_secs(59)));
+        assert!(
+            logger.should_log(base + std::time::Duration::from_secs(60)),
+            "the window re-arms after the interval"
+        );
+        assert!(!logger.should_log(base + std::time::Duration::from_secs(65)));
+    }
+
+    /// The helper must poll one and the same future: a rebuilt future would
+    /// restart the sleep on every tick and never complete (#373).
+    #[tokio::test]
+    async fn stall_polling_reports_and_does_not_rebuild_the_future() {
+        let token = CancellationToken::new();
+        let mut reports = 0u32;
+        let value = poll_with_stall_reports(
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(35)).await;
+                7u32
+            },
+            std::time::Duration::from_millis(10),
+            &token,
+            |_| reports += 1,
+        )
+        .await;
+
+        // Completion is the real proof that the future was not rebuilt: a
+        // rebuilt future would restart the 35 ms sleep on every tick and never
+        // finish. The count only needs to show that stalls were reported.
+        assert_eq!(value, Some(7));
+        assert!(
+            reports >= 1,
+            "a 35 ms wait with a 10 ms interval must report a stall, got {reports}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stall_polling_is_silent_when_the_future_completes_at_once() {
+        let token = CancellationToken::new();
+        let mut reports = 0u32;
+        let value = poll_with_stall_reports(
+            async { 3u32 },
+            std::time::Duration::from_millis(10),
+            &token,
+            |_| reports += 1,
+        )
+        .await;
+        assert_eq!(value, Some(3));
+        assert_eq!(reports, 0);
+    }
+
+    #[tokio::test]
+    async fn stall_polling_stops_on_cancellation() {
+        let token = CancellationToken::new();
+        token.cancel();
+        let mut reports = 0u32;
+        let value = poll_with_stall_reports(
+            std::future::pending::<u32>(),
+            std::time::Duration::from_millis(10),
+            &token,
+            |_| reports += 1,
+        )
+        .await;
+        assert_eq!(value, None, "a cancelled wait reports no value");
+        assert_eq!(reports, 0, "no progress updates after cancellation");
+    }
 
     // ── compress_uid_list ──────────────────────────────────────────
 
@@ -1277,6 +2001,7 @@ mod test {
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].0, "1:3");
         assert_eq!(batches[0].1, 3);
+        assert_eq!(batches[0].2, 3);
     }
 
     #[test]
@@ -1285,10 +2010,32 @@ mod test {
         assert_eq!(batches.len(), 3);
         assert_eq!(batches[0].0, "1:2");
         assert_eq!(batches[0].1, 2);
+        assert_eq!(batches[0].2, 2);
         assert_eq!(batches[1].0, "3:4");
         assert_eq!(batches[1].1, 2);
+        assert_eq!(batches[1].2, 4);
         assert_eq!(batches[2].0, "5");
         assert_eq!(batches[2].1, 1);
+        assert_eq!(batches[2].2, 5);
+    }
+
+    /// The download loops persist each batch's maximum UID as the folder's
+    /// resume cursor, which is only sound because the list is sorted before
+    /// batching: every UID of a later batch is greater than every UID of an
+    /// earlier one. A batch maximum is therefore a contiguous cursor.
+    #[test]
+    fn batch_maxima_are_strictly_ascending() {
+        // Gaps mirror expunged/oversized UIDs, which are excluded before
+        // batching and must not influence the ordering.
+        let batches = generate_uid_sequence_hashset(vec![2, 5, 9, 10, 11, 40, 41], 3);
+        assert_eq!(batches.len(), 3);
+        let maxima: Vec<u32> = batches.iter().map(|b| b.2).collect();
+        assert_eq!(maxima, vec![9, 40, 41]);
+        assert!(
+            maxima.windows(2).all(|w| w[0] < w[1]),
+            "batch maxima must be strictly ascending: {maxima:?}"
+        );
+        assert_eq!(batches[1].0, "10:11,40");
     }
 
     // ── filter_before_date ─────────────────────────────────────────
@@ -1399,6 +2146,82 @@ To: recipient@example.com\r\n\r\n";
             parse_message_id_header(header),
             Some("plain@example.com".into())
         );
+    }
+
+    // ── parse_message_id_header: folded / case / encoding (#368) ────
+
+    #[test]
+    fn parse_folded_message_id() {
+        // The value sits on the continuation line, as sent by many providers
+        // for long ids. The old prefix scan returned None here and gap-fill
+        // re-downloaded the message.
+        let header = b"Message-ID:\r\n <1234567890.12345.1781210050567@some-long-host-name.example>\r\n\r\n";
+        assert_eq!(
+            parse_message_id_header(header),
+            Some("1234567890.12345.1781210050567@some-long-host-name.example".into())
+        );
+    }
+
+    #[test]
+    fn parse_folded_message_id_tab_continuation() {
+        let header = b"Message-ID:\r\n\t<tabbed@example.com>\r\n\r\n";
+        assert_eq!(
+            parse_message_id_header(header),
+            Some("tabbed@example.com".into())
+        );
+    }
+
+    #[test]
+    fn parse_lowercase_header_name() {
+        let header = b"message-id: <lower@example.com>\r\n\r\n";
+        assert_eq!(
+            parse_message_id_header(header),
+            Some("lower@example.com".into())
+        );
+    }
+
+    #[test]
+    fn parse_uppercase_header_name() {
+        let header = b"MESSAGE-ID: <upper@example.com>\r\n\r\n";
+        assert_eq!(
+            parse_message_id_header(header),
+            Some("upper@example.com".into())
+        );
+    }
+
+    #[test]
+    fn parse_message_id_with_trailing_comment() {
+        // Only the id is kept; the comment must not leak into the comparison.
+        let header = b"Message-ID: <commented@example.com> (added by mx)\r\n\r\n";
+        assert_eq!(
+            parse_message_id_header(header),
+            Some("commented@example.com".into())
+        );
+    }
+
+    #[test]
+    fn parse_message_id_non_utf8_is_lossy() {
+        // A header block that is not valid UTF-8 must not yield None: both
+        // sides decode it lossily, so the comparison still works.
+        let header = b"Message-ID: <abc\xff@example.com>\r\n\r\n";
+        assert_eq!(
+            parse_message_id_header(header),
+            Some("abc\u{FFFD}@example.com".into())
+        );
+    }
+
+    #[test]
+    fn parse_header_fields_block_matches_full_message() {
+        // A HEADER.FIELDS (MESSAGE-ID) block must produce exactly the value
+        // the archiver stored from the full message; otherwise gap-fill marks
+        // the message missing. This pins the two sides together.
+        let full = b"From: a@b.example\r\nTo: c@d.example\r\nMessage-ID:\r\n <same@example.com>\r\n\r\nbody";
+        let block = b"Message-ID:\r\n <same@example.com>\r\n\r\n";
+        let archived = MessageParser::default()
+            .parse(full)
+            .and_then(|message| message.message_id().map(str::to_string));
+        assert_eq!(archived.as_deref(), Some("same@example.com"));
+        assert_eq!(parse_message_id_header(block), archived);
     }
 
     // ── empty_enumeration_anomaly ──────────────────────────────────
@@ -1570,6 +2393,294 @@ To: recipient@example.com\r\n\r\n";
             vec![1, 2, 3]
         );
         assert_eq!(skipped, 1);
+        session.logout().await.ok();
+    }
+
+    // ============================================================
+    // Login / command error classification (#396)
+    // ============================================================
+
+    fn io_err(kind: std::io::ErrorKind) -> async_imap::error::Error {
+        async_imap::error::Error::Io(std::io::Error::new(kind, "boom"))
+    }
+
+    #[test]
+    fn throttle_text_matches_real_server_banners() {
+        assert!(is_throttle_text(
+            "code: Some(Alert), info: Some(\"Account exceeded command or bandwidth limits. (Failure)\")"
+        ));
+        assert!(is_throttle_text(
+            "NO [LIMIT] Too many simultaneous connections"
+        ));
+        assert!(is_throttle_text("NO [UNAVAILABLE] Too many connections"));
+        assert!(is_throttle_text("NO [OVERQUOTA] mailbox is full"));
+        assert!(is_throttle_text("User rate limit exceeded"));
+        assert!(is_throttle_text("service temporarily unavailable"));
+    }
+
+    #[test]
+    fn throttle_text_ignores_ordinary_failures() {
+        assert!(!is_throttle_text(
+            "NO [AUTHENTICATIONFAILED] Invalid credentials"
+        ));
+        assert!(!is_throttle_text("mailbox does not exist"));
+        // Dovecot marks a deleted/renamed mailbox `[UNAVAILABLE]`; that is a
+        // single-folder problem and must not stop the whole round.
+        assert!(!is_throttle_text(
+            "NO [UNAVAILABLE] Mailbox is no longer available"
+        ));
+        assert!(!is_throttle_text(""));
+    }
+
+    #[test]
+    fn auth_text_wins_over_throttle_text() {
+        // Dovecot/Exchange can mention connections in an auth rejection; a
+        // credential problem must never be retried as throttling.
+        let text = "authentication failed after too many connections";
+        assert!(is_auth_text(text));
+        assert_eq!(
+            classify_login_error(&async_imap::error::Error::No(text.into())),
+            ErrorCode::ImapAuthenticationFailed
+        );
+    }
+
+    #[test]
+    fn classify_login_error_throttled_exchange() {
+        let e = async_imap::error::Error::No(
+            "code: Some(Alert), info: Some(\"Account exceeded command or bandwidth limits. (Failure)\")"
+                .into(),
+        );
+        assert_eq!(classify_login_error(&e), ErrorCode::ImapServerThrottled);
+    }
+
+    #[test]
+    fn classify_login_error_bad_credentials() {
+        let e = async_imap::error::Error::No(
+            "[AUTHENTICATIONFAILED] Invalid credentials (Failure)".into(),
+        );
+        assert_eq!(classify_login_error(&e), ErrorCode::ImapAuthenticationFailed);
+    }
+
+    #[test]
+    fn classify_login_error_unknown_no_is_auth_failure() {
+        // An unrecognised NO during LOGIN is still a login rejection.
+        let e = async_imap::error::Error::No("something odd".into());
+        assert_eq!(classify_login_error(&e), ErrorCode::ImapAuthenticationFailed);
+    }
+
+    #[test]
+    fn classify_login_error_timeout_is_network_not_auth() {
+        // The #396 logs reported these as "password auth failed".
+        assert_eq!(
+            classify_login_error(&io_err(std::io::ErrorKind::TimedOut)),
+            ErrorCode::NetworkError
+        );
+        assert_eq!(
+            classify_login_error(&io_err(std::io::ErrorKind::ConnectionReset)),
+            ErrorCode::NetworkError
+        );
+        assert_eq!(
+            classify_login_error(&async_imap::error::Error::ConnectionLost),
+            ErrorCode::NetworkError
+        );
+    }
+
+    #[test]
+    fn classify_imap_error_throttled_command() {
+        let e = async_imap::error::Error::No(
+            "code: Some(Alert), info: Some(\"Account exceeded command or bandwidth limits. (Failure)\")"
+                .into(),
+        );
+        assert_eq!(classify_imap_error(&e), ErrorCode::ImapServerThrottled);
+    }
+
+    #[test]
+    fn classify_imap_error_keeps_command_failures_generic() {
+        let e = async_imap::error::Error::No("[NONEXISTENT] no such mailbox".into());
+        assert_eq!(classify_imap_error(&e), ErrorCode::ImapCommandFailed);
+    }
+
+    #[test]
+    fn classify_imap_error_timeout_is_network() {
+        assert_eq!(
+            classify_imap_error(&io_err(std::io::ErrorKind::TimedOut)),
+            ErrorCode::NetworkError
+        );
+        assert_eq!(
+            classify_imap_error(&io_err(std::io::ErrorKind::PermissionDenied)),
+            ErrorCode::ImapCommandFailed
+        );
+    }
+
+    // ============================================================
+    // Empty-range resolution (#396)
+    // ============================================================
+
+    #[test]
+    fn empty_range_without_uidnext_is_not_an_anomaly() {
+        assert_eq!(
+            empty_range_resolution(150, None, &[]),
+            EmptyRangeAction::Nothing
+        );
+    }
+
+    #[test]
+    fn empty_range_below_watermark_is_not_an_anomaly() {
+        assert_eq!(
+            empty_range_resolution(150, Some(150), &[]),
+            EmptyRangeAction::Nothing
+        );
+        assert_eq!(
+            empty_range_resolution(150, Some(140), &[]),
+            EmptyRangeAction::Nothing
+        );
+    }
+
+    #[test]
+    fn empty_range_proven_expunged_advances_to_uidnext_minus_one() {
+        // Exchange keeps UIDNEXT=153 after UIDs 150..152 were deleted.
+        assert_eq!(
+            empty_range_resolution(150, Some(153), &[]),
+            EmptyRangeAction::Advance(152)
+        );
+        // UIDs below the watermark in the probe do not count.
+        assert_eq!(
+            empty_range_resolution(150, Some(153), &[140, 149]),
+            EmptyRangeAction::Advance(152)
+        );
+    }
+
+    #[test]
+    fn empty_range_probe_finding_mail_keeps_the_watermark() {
+        assert_eq!(
+            empty_range_resolution(150, Some(153), &[151]),
+            EmptyRangeAction::Retry
+        );
+        assert_eq!(
+            empty_range_resolution(150, Some(153), &[150, 151, 152]),
+            EmptyRangeAction::Retry
+        );
+    }
+
+    // ============================================================
+    // Empty-range convergence through the real fetch path (#396)
+    // ============================================================
+
+    /// The download path touches `DownloadState`, which needs the settings and
+    /// a private memdb root (same convention as the other core DB tests).
+    fn init_test_env() {
+        use std::sync::Once;
+        static TEST_ENV: Once = Once::new();
+        TEST_ENV.call_once(|| {
+            let root = crate::test_support::unique_test_root("bichon-core-test");
+            std::env::set_var("BICHON_ROOT_DIR", &root);
+            std::env::set_var("BICHON_ENCRYPT_PASSWORD", "test-password");
+            let _ = &*crate::settings::cli::SETTINGS;
+            let _ = &*crate::settings::dir::DATA_DIR_MANAGER;
+            let _ = &*crate::database::manager::DB_MANAGER;
+        });
+    }
+
+    async fn mock_session_and_examined(
+        handle: &MockImapServerHandle,
+    ) -> (
+        async_imap::Session<Box<dyn SessionStream>>,
+        async_imap::types::Mailbox,
+    ) {
+        let tcp = tokio::net::TcpStream::connect((handle.host(), handle.port()))
+            .await
+            .unwrap();
+        let timeout_stream = TimeoutStream::new(tcp);
+        let pinned: std::pin::Pin<Box<TimeoutStream<tokio::net::TcpStream>>> =
+            Box::pin(timeout_stream);
+        let stream: Box<dyn SessionStream> = Box::new(pinned);
+        let mut client = async_imap::Client::new(stream);
+        client.read_response().await.unwrap();
+        let mut session = client
+            .login("user", "pass")
+            .await
+            .map_err(|(e, _)| panic!("Login failed: {e:?}"))
+            .unwrap();
+        let examined = session.examine("INBOX").await.unwrap();
+        (session, examined)
+    }
+
+    #[tokio::test]
+    async fn expunged_tail_advances_the_watermark_and_stops_the_retry_loop() {
+        init_test_env();
+        let handle = MockImapServer::new()
+            .respond("LOGIN", "{TAG} OK LOGIN done\r\n")
+            .respond("EXAMINE", examine_response("INBOX", 149, 42, 153))
+            // Enumeration of `150:*` returns nothing although UIDNEXT=153.
+            .respond("UID FETCH 150:*", "{TAG} OK FETCH completed\r\n")
+            // The closed-interval re-check also proves nothing exists.
+            .respond("UID FETCH 150:152", "{TAG} OK FETCH completed\r\n")
+            .start()
+            .await;
+
+        let (mut session, examined) = mock_session_and_examined(&handle).await;
+        let account = AccountModel::default();
+        let mut mailbox = MailBox::default();
+        mailbox.name = "INBOX".into();
+
+        let result = ImapExecutor::fetch_new_mail_range(
+            &mut session,
+            &account,
+            &mailbox,
+            150,
+            examined,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.highest_uid,
+            Some(152),
+            "a proven-empty tail must advance highest_uid to UIDNEXT-1, \
+             otherwise the folder re-enumerates the same range every round"
+        );
+        assert!(!result.stalled);
+        session.logout().await.ok();
+    }
+
+    #[tokio::test]
+    async fn truncated_range_fetch_keeps_the_watermark() {
+        init_test_env();
+        let handle = MockImapServer::new()
+            .respond("LOGIN", "{TAG} OK LOGIN done\r\n")
+            .respond("EXAMINE", examine_response("INBOX", 152, 42, 153))
+            // The first fetch returns nothing...
+            .respond("UID FETCH 150:*", "{TAG} OK FETCH completed\r\n")
+            // ...but the closed-interval re-check finds UID 151, so the first
+            // answer was truncated: never skip it.
+            .respond(
+                "UID FETCH 150:152",
+                "* 151 FETCH (UID 151)\r\n{TAG} OK FETCH completed\r\n",
+            )
+            .start()
+            .await;
+
+        let (mut session, examined) = mock_session_and_examined(&handle).await;
+        let account = AccountModel::default();
+        let mut mailbox = MailBox::default();
+        mailbox.name = "INBOX".into();
+
+        let result = ImapExecutor::fetch_new_mail_range(
+            &mut session,
+            &account,
+            &mailbox,
+            150,
+            examined,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.highest_uid, None,
+            "a range that does contain mail must keep highest_uid unchanged"
+        );
         session.logout().await.ok();
     }
 }

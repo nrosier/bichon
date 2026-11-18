@@ -18,6 +18,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::str::FromStr;
 use tracing::info;
 
 use crate::{
@@ -28,7 +29,7 @@ use crate::{
         state::DownloadState,
     },
     archive::imap::{mailbox::MailBox, task::SYNC_TASKS},
-    common::paginated::DataPage,
+    common::{auth::ClientContext, paginated::DataPage},
     context::controller::DOWNLOAD_CONTROLLER,
     database::{
         count_impl, delete_impl, find_impl, insert_impl, list_all_impl, manager::DB_MANAGER,
@@ -36,6 +37,7 @@ use crate::{
     },
     encrypt,
     error::{code::ErrorCode, BichonResult},
+    ext::event_bus::emit,
     id,
     oauth2::token::OAuth2AccessToken,
     raise_error,
@@ -51,7 +53,16 @@ pub type AccountModel = Account;
 pub enum AccountType {
     #[default]
     IMAP,
+    /// A local account that stores its own mail (import target, journal
+    /// archive, or a hand-made local mailbox).
     NoSync,
+    /// A read-only, filter-scoped view over one or more other accounts.
+    ///
+    /// A *type*, not a flag: a view stores nothing, is never synced, receives
+    /// no SMTP, and every "is this a storage account?" check must answer "no"
+    /// without remembering a special case. Its sources and filters live in
+    /// [`Account::view`].
+    View,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
@@ -289,6 +300,264 @@ fn validate_non_empty(patterns: &[String], field_name: &str) -> Result<(), Strin
     Ok(())
 }
 
+/// Fixed destination folder for source-mailbox cleanup. Bichon creates and
+/// owns this folder; it is never used as a download source.
+pub const REMOTE_CLEANUP_FOLDER: &str = "bichon_auto_created_trash";
+
+/// Minimum grace period between archiving a message and moving it out of the
+/// source mailbox: none. Zero means "eligible on the next run" and is a valid
+/// setting, because the move is reversible — the message lands in
+/// [`REMOTE_CLEANUP_FOLDER`] on the same server and the local archive keeps its
+/// copy — and a message whose local copy fails verification is skipped rather
+/// than moved. Emptying that folder is the irreversible step, and it is gated
+/// separately on a recent successful backup. Holding mail in the source
+/// mailbox while the archive fills is still the default (30 days), not a floor.
+pub const MIN_REMOTE_CLEANUP_GRACE_DAYS: u64 = 0;
+
+/// Hard ceiling on one cleanup run. The scheduled task is deliberately slow;
+/// callers may lower this, never exceed it.
+pub const MAX_REMOTE_CLEANUP_PER_RUN: u64 = 500;
+
+fn default_cleanup_grace_days() -> u64 {
+    30
+}
+
+fn default_cleanup_max_per_run() -> u64 {
+    50
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Configuration for moving archived mail out of the source IMAP mailbox into
+/// [`REMOTE_CLEANUP_FOLDER`].
+///
+/// Moving is reversible (the message still exists on the server) and may run on
+/// a schedule. Permanently emptying that folder is a separate, explicit API
+/// operation and is never scheduled.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[cfg_attr(feature = "web-api", derive(poem_openapi::Object))]
+pub struct RemoteCleanupConfig {
+    /// Master switch for the scheduled move task. Default off.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Cron expression for the scheduled move task.
+    #[serde(default)]
+    pub schedule: Option<String>,
+    /// Source folders. `None` = the account's download folders, minus
+    /// special-use folders and the cleanup destination.
+    #[serde(default)]
+    pub folders: Option<Vec<String>>,
+    /// Only move messages archived at least this many days ago.
+    /// Measured from the envelope's `ingest_at`.
+    #[serde(default = "default_cleanup_grace_days")]
+    pub eligible_after_archive_days: u64,
+    /// Optional additional message-age floor (based on the message date).
+    /// `None` = no extra floor; accounts using `date_before` already bound it.
+    #[serde(default)]
+    pub min_message_age_days: Option<u64>,
+    /// Maximum messages moved in one batch.
+    #[serde(default = "default_cleanup_max_per_run")]
+    pub max_messages_per_run: u64,
+    /// Leave flagged/starred messages in the source mailbox.
+    #[serde(default = "default_true")]
+    pub skip_flagged: bool,
+    // There is deliberately no pause flag: `enabled` and the schedule are the
+    // only ways to stop runs.
+}
+
+impl Default for RemoteCleanupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            schedule: None,
+            folders: None,
+            eligible_after_archive_days: default_cleanup_grace_days(),
+            min_message_age_days: None,
+            max_messages_per_run: default_cleanup_max_per_run(),
+            skip_flagged: true,
+        }
+    }
+}
+
+impl RemoteCleanupConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        // No lower bound on `eligible_after_archive_days`: 0 is a valid choice
+        // ("eligible on the next run") because the move is reversible. See
+        // MIN_REMOTE_CLEANUP_GRACE_DAYS.
+        if self.max_messages_per_run == 0 || self.max_messages_per_run > MAX_REMOTE_CLEANUP_PER_RUN {
+            return Err(format!(
+                "max_messages_per_run must be between 1 and {MAX_REMOTE_CLEANUP_PER_RUN}"
+            ));
+        }
+        if let Some(days) = self.min_message_age_days {
+            if days == 0 {
+                return Err("min_message_age_days must be greater than 0 when set".into());
+            }
+        }
+        if let Some(schedule) = &self.schedule {
+            if schedule.trim().is_empty() {
+                return Err("cleanup schedule must not be empty".into());
+            }
+            cron::Schedule::from_str(schedule)
+                .map_err(|e| format!("Invalid cleanup schedule '{schedule}': {e}"))?;
+        }
+        if let Some(folders) = &self.folders {
+            if folders.is_empty() {
+                return Err("cleanup folders must not be empty when set".into());
+            }
+            for folder in folders {
+                if folder.trim().is_empty() {
+                    return Err("cleanup folder name must not be empty".into());
+                }
+                if folder.eq_ignore_ascii_case(REMOTE_CLEANUP_FOLDER) {
+                    return Err(format!(
+                        "'{REMOTE_CLEANUP_FOLDER}' cannot be a cleanup source folder"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What `kind.role` says the account is. `AccountType` stays the storage type
+/// (IMAP / NoSync); this is the *special role* on top of it.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[cfg_attr(feature = "web-api", derive(poem_openapi::Enum))]
+#[serde(rename_all = "snake_case")]
+pub enum AccountKindRole {
+    /// The account SMTP journal deliveries are filed into. Reserved for the
+    /// journaling configuration — it cannot be chosen when creating an
+    /// account by hand.
+    ///
+    /// `view` is deliberately **not** a role: it is an [`AccountType`] of its
+    /// own, because a view stores nothing and every storage-related check must
+    /// exclude it by type rather than by remembering a flag.
+    #[default]
+    #[cfg_attr(feature = "web-api", oai(rename = "journal"))]
+    Journal,
+}
+
+/// A view's restriction on one source account.
+///
+/// Every condition set here is **ANDed** with whatever the viewer searches
+/// for: a view can only ever narrow, never widen. An empty filter exposes the
+/// whole source read-only — a deliberate, administrator-chosen delegation.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[cfg_attr(feature = "web-api", derive(poem_openapi::Object))]
+pub struct ViewSource {
+    pub account_id: u64,
+    /// The message must have **at least one** of these addresses in From, To,
+    /// Cc or Bcc (OR within the field).
+    ///
+    /// A person with several addresses, or a view over a small team, needs more
+    /// than one. The serde adapter also accepts a single string, so a row
+    /// written against the first version of this field (one address) still
+    /// parses.
+    #[serde(
+        default,
+        deserialize_with = "one_or_many",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    #[cfg_attr(feature = "web-api", oai(default))]
+    pub any_participant: Vec<String>,
+    /// The message must have **at least one** of these addresses in To, Cc or
+    /// Bcc (OR within the field).
+    #[serde(
+        default,
+        deserialize_with = "one_or_many",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    #[cfg_attr(feature = "web-api", oai(default))]
+    pub any_recipient: Vec<String>,
+}
+
+impl ViewSource {
+    /// A source without any condition: the whole account is delegated.
+    ///
+    /// The distinction matters wherever a caller can only work with *account
+    /// ids* — the attachment index, the aggregate endpoints, the dashboard —
+    /// because those cannot evaluate a participant filter and must therefore
+    /// leave a filtered source out entirely rather than expose all of it.
+    pub fn is_unfiltered(&self) -> bool {
+        self.any_participant.is_empty() && self.any_recipient.is_empty()
+    }
+}
+
+/// Accept both `"a@b.de"` and `["a@b.de", "c@d.de"]` (and `null`).
+fn one_or_many<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    Ok(
+        match Option::<OneOrMany>::deserialize(deserializer)? {
+            None => Vec::new(),
+            Some(OneOrMany::One(address)) => vec![address],
+            Some(OneOrMany::Many(addresses)) => addresses,
+        },
+    )
+}
+
+/// Optional special role of an account.
+///
+/// Kept separate from [`AccountType`] on purpose: a journal archive and a view
+/// are both `NoSync` accounts, and overloading the type would have made every
+/// existing `account_type` check wrong. `None` — the default, and what every
+/// row written before this field existed deserializes to — is an ordinary
+/// account.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[cfg_attr(feature = "web-api", derive(poem_openapi::Object))]
+pub struct AccountKind {
+    pub role: AccountKindRole,
+    /// Journal: the address the tenant's journaling rule delivers to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_address: Option<String>,
+}
+
+/// Configuration of an [`AccountType::View`] account.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[cfg_attr(feature = "web-api", derive(poem_openapi::Object))]
+pub struct ViewConfig {
+    /// The accounts the view reads from, each with its own filter.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<ViewSource>,
+}
+
+/// What an account update did to a view's scope, for the audit trail.
+///
+/// A bare `account.updated` line cannot distinguish renaming a view from
+/// dropping its filters — and the second is a widening of someone's visibility
+/// that nobody could reconstruct afterwards. Both sides are recorded, because
+/// "from what" is half the answer.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ViewConfigChange {
+    pub before: Option<ViewConfig>,
+    pub after: Option<ViewConfig>,
+}
+
+impl ViewConfigChange {
+    /// `None` when the scope is unchanged, so a rename or an unrelated field
+    /// leaves no view record behind.
+    pub fn between(before: Option<&ViewConfig>, after: Option<&ViewConfig>) -> Option<Self> {
+        if before == after {
+            return None;
+        }
+        Some(Self {
+            before: before.cloned(),
+            after: after.cloned(),
+        })
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 #[cfg_attr(feature = "web-api", derive(poem_openapi::Object))]
 pub struct Account {
@@ -331,6 +600,12 @@ pub struct Account {
     /// `None` = extract everything (backward compatible).
     #[serde(default)]
     pub extraction_rules: Option<ExtractionRules>,
+    /// Ordered header names checked at ingest. The first one that parses to a
+    /// valid mailbox replaces the stored `from` address; the original address
+    /// is kept in `wire_from`. `None` = disabled, and it is also what every
+    /// account written before this field existed deserializes to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_from_headers: Option<Vec<String>>,
     /// Account-level retention period in days (free/community feature).
     /// `None` or `0` = disabled (archive everything, never auto-purge).
     /// A background sweep purges envelopes whose effective date
@@ -338,6 +613,20 @@ pub struct Account {
     /// legal hold are always exempt.
     #[serde(default)]
     pub retention_days: Option<u64>,
+    /// Minimum retention in days (Enterprise compliance). While set, messages
+    /// whose effective date is still inside this window cannot be deleted —
+    /// not by a single delete, a batch job, a mailbox deletion or an account
+    /// deletion. `None` or `0` disables the lock.
+    ///
+    /// The retention sweep is capped by this value too: it never purges a
+    /// message younger than the longer of `retention_days` and this window.
+    #[serde(default)]
+    pub min_retention_days: Option<u64>,
+    /// Source-mailbox cleanup (community feature). `None` = not configured.
+    /// Moving archived mail to [`REMOTE_CLEANUP_FOLDER`] may be scheduled;
+    /// permanently emptying that folder never is.
+    #[serde(default)]
+    pub remote_cleanup: Option<RemoteCleanupConfig>,
     /// Legal hold flag (Enterprise feature; community edition has no setter
     /// and this stays at its default of `false` forever). While set, the
     /// account's data is frozen: the retention sweep skips the account and
@@ -359,6 +648,35 @@ pub struct Account {
     /// Epoch millis when the hold was released.
     #[serde(default)]
     pub hold_released_at: Option<i64>,
+    /// Optional special role — journal archive or read-only view.
+    ///
+    /// `None` is an ordinary account, and it is also what every row written
+    /// before this field existed deserializes to, so the field is additive and
+    /// backward compatible. `AccountType` is deliberately untouched: a journal
+    /// account and a view are both `NoSync` accounts, and overloading the type
+    /// would have made every existing `account_type` check wrong.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<AccountKind>,
+    /// Sources and per-source filters of an [`AccountType::View`] account.
+    /// `None` for every other account type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<ViewConfig>,
+    /// Archive-side IMAP UID counter: the lowest value that has NOT been handed
+    /// out yet for this account. Block-reserved, monotonic, never regresses.
+    /// 0 = never initialized.
+    ///
+    /// Lives on the account row (not on `MailBox`) because every account write
+    /// is a read-modify-write (`update_impl`), while mailbox rows are rewritten
+    /// wholesale from remote listings (`download/flow.rs`), which would silently
+    /// reset a counter stored there — and a reset counter reissues UIDs.
+    #[serde(default)]
+    pub imap_uid_next: u64,
+    /// UIDVALIDITY generation. Bumped when this account's UID space effectively
+    /// restarts (a restore to an earlier backup point, or a counter found
+    /// behind the index), which invalidates every client cache for the account.
+    /// See `archive::imap::stable_uid::uid_validity`.
+    #[serde(default)]
+    pub imap_uid_generation: u32,
 }
 
 impl MemDbModel for Account {
@@ -381,6 +699,24 @@ fn normalize_optional_name(name: Option<String>) -> Option<String> {
 }
 
 impl Account {
+    /// The account SMTP journal deliveries are filed into.
+    pub fn is_journal_account(&self) -> bool {
+        matches!(
+            self.kind.as_ref().map(|k| &k.role),
+            Some(AccountKindRole::Journal)
+        )
+    }
+
+    /// A read-only, filter-scoped view over other accounts.
+    pub fn is_view_account(&self) -> bool {
+        matches!(self.account_type, AccountType::View)
+    }
+
+    /// Whether the account stores mail of its own (as opposed to a view).
+    pub fn stores_mail(&self) -> bool {
+        !self.is_view_account()
+    }
+
     pub fn new(user_id: u64, request: AccountCreateRequest) -> BichonResult<Self> {
         Ok(Self {
             id: id!(64),
@@ -410,13 +746,20 @@ impl Account {
             deleting: false,
             archive_rules: request.archive_rules,
             extraction_rules: request.extraction_rules,
+            override_from_headers: request.override_from_headers,
             retention_days: request.retention_days,
+            min_retention_days: request.min_retention_days,
+            remote_cleanup: request.remote_cleanup,
             legal_hold: false,
             hold_reason: None,
             hold_placed_by: None,
             hold_placed_at: None,
             hold_released_by: None,
             hold_released_at: None,
+            kind: request.kind,
+            view: request.view,
+            imap_uid_next: 0,
+            imap_uid_generation: 0,
         })
     }
 
@@ -435,6 +778,12 @@ impl Account {
         self.retention_days.unwrap_or(0)
     }
 
+    /// Effective minimum-retention (deletion lock) window. `0` / `None`
+    /// means no lock.
+    pub fn min_retention_days_effective(&self) -> u64 {
+        self.min_retention_days.unwrap_or(0)
+    }
+
     pub fn get(account_id: u64) -> BichonResult<AccountModel> {
         let result: AccountModel = Self::find(account_id)?.ok_or_else(|| {
             raise_error!(
@@ -450,15 +799,38 @@ impl Account {
         Ok(result)
     }
 
+    /// Create an account on `context`'s user's behalf.
+    ///
+    /// Takes the `ClientContext`, not a bare user id, because the view rule is
+    /// a permission check — creating a view delegates read access to the
+    /// accounts it names, so the caller must hold `account:manage` on every
+    /// source. Enforcing it *here* rather than in the REST handler means a
+    /// second caller (a CLI, an approval executor, an MCP tool) cannot create a
+    /// view without it.
     pub async fn create_account(
         user_id: u64,
         request: AccountCreateRequest,
+        context: &ClientContext,
     ) -> BichonResult<AccountModel> {
+        if matches!(request.account_type, AccountType::View) {
+            let sources = request
+                .view
+                .as_ref()
+                .map(|view| view.sources.as_slice())
+                .unwrap_or(&[]);
+            crate::account::access::require_view_source_management(context, sources)?;
+        }
         let entity = request.create_entity(user_id)?;
         let cloned = entity.clone();
 
-        // Insert account into memdb
-        insert_impl(DB_MANAGER.db(), entity)?;
+        // Insert account into memdb. The license limit check (Pro/Enterprise)
+        // runs inside `insert_account_checked` under the same lock as the
+        // insert, so concurrent creations cannot both pass a check that only
+        // one should have. The type is passed because the edition decides
+        // which account types consume a licence slot (Pro exempts views).
+        crate::ext::license_gate::insert_account_checked(&cloned.account_type, || {
+            insert_impl(DB_MANAGER.db(), entity)
+        })?;
 
         // Update user's account_access_map
         let user = UserModel::find(user_id)?.ok_or_else(|| {
@@ -495,14 +867,37 @@ impl Account {
         Ok(cloned)
     }
 
+    /// Update an account on `context`'s user's behalf.
+    ///
+    /// Validation is unconditional and the view rule is enforced here, not by
+    /// the caller: editing a view can widen what it exposes, so every source in
+    /// the submitted configuration must be one the caller manages (or be kept
+    /// exactly as it was). See
+    /// [`crate::account::access::require_view_source_management_for_update`].
+    ///
+    /// This returns `()`, so a caller that needs to *audit* a scope change has
+    /// to read the old view first — as the REST handler does before emitting
+    /// `Event::AccountUpdated` with its `view_change`. The permission rule is
+    /// enforced here; the record is not, because the record needs an actor
+    /// name this function does not receive.
     pub fn update(
         account_id: u64,
         request: AccountUpdateRequest,
-        validate: bool,
+        context: &ClientContext,
     ) -> BichonResult<()> {
         let account = AccountModel::get(account_id)?;
-        if validate {
-            request.validate_update_request(&account)?;
+        request.validate_update_request(&account)?;
+        if let Some(view) = &request.view {
+            let old_sources = account
+                .view
+                .as_ref()
+                .map(|old| old.sources.as_slice())
+                .unwrap_or(&[]);
+            crate::account::access::require_view_source_management_for_update(
+                context,
+                old_sources,
+                &view.sources,
+            )?;
         }
         update_impl(
             DB_MANAGER.db(),
@@ -513,7 +908,14 @@ impl Account {
         Ok(())
     }
 
+    /// Mark an account for deletion; the purge runs in the background.
+    ///
+    /// The refusal checks live in [`Self::delete_and_wait`], which this spawns —
+    /// but they are repeated here first, because the spawned task's error can
+    /// only be logged: without this the HTTP caller would get a success for a
+    /// deletion that never happened.
     pub async fn delete(account_id: u64) -> BichonResult<()> {
+        Self::ensure_deletable(&Self::get(account_id)?)?;
         // Spawn background cleanup — heavy work (Tantivy, attachments) runs off the request path
         tokio::spawn(async move {
             if let Err(error) = Self::delete_and_wait(account_id).await {
@@ -524,6 +926,79 @@ impl Account {
                 );
             }
         });
+        Ok(())
+    }
+
+    /// The conditions under which an account may not be deleted at all.
+    ///
+    /// Pure and synchronous so both delete paths (`delete` for HTTP,
+    /// `delete_and_wait` for the dual-control executor) refuse for exactly the
+    /// same reasons, and so the rules are testable without a database.
+    pub fn ensure_deletable(account: &AccountModel) -> BichonResult<()> {
+        // Legal hold: an account under a hold is frozen — deleting the account
+        // would cascade-purge every message and attachment it holds, defeating
+        // the purpose of the hold. Refuse before any state is mutated. In the
+        // community edition `legal_hold` is always false, so this guard is a
+        // no-op there.
+        if account.is_on_hold() {
+            return Err(raise_error!(
+                format!(
+                    "Account {} ({}) is under a legal hold; deleting the account is disabled while the hold is active",
+                    account.id, account.email
+                ),
+                ErrorCode::Forbidden
+            ));
+        }
+
+        // Minimum retention: deleting the account would cascade-purge mail
+        // the customer is legally required to keep. Disable the lock first
+        // (a root-only, audited change), then delete.
+        if account.min_retention_days_effective() > 0 {
+            return Err(raise_error!(
+                format!(
+                    "Account {} ({}) has a {}-day minimum retention lock; clear it before deleting the account",
+                    account.id,
+                    account.email,
+                    account.min_retention_days_effective()
+                ),
+                ErrorCode::Forbidden
+            ));
+        }
+
+        // Journal archive: this account is the one complete copy of everything
+        // the customer's journaling rule produced. There is no way to rebuild
+        // it — the rule only carries mail from the moment it was configured,
+        // and the source mailboxes may long be gone. Refuse unconditionally;
+        // unlike a view, it is not an access wrapper but the archive itself.
+        if account.is_journal_account() {
+            return Err(raise_error!(
+                format!(
+                    "Account {} ({}) is a journal archive and cannot be deleted; \
+                     point journaling at another address instead and keep this record",
+                    account.id, account.email
+                ),
+                ErrorCode::Forbidden
+            ));
+        }
+
+        // A view source: deleting it would leave the view pointing at an id
+        // that no longer exists — its results silently shrink, and the row
+        // cannot be repaired from the UI (there is no account left to select).
+        // The operator removes it from the view first, then deletes.
+        let views = crate::account::access::views_referencing(&Self::list_all()?, account.id);
+        if !views.is_empty() {
+            let listed: Vec<String> = views.iter().map(|id| id.to_string()).collect();
+            return Err(raise_error!(
+                format!(
+                    "Account {} ({}) is a source of view account(s) {}; remove it from those views first",
+                    account.id,
+                    account.email,
+                    listed.join(", ")
+                ),
+                ErrorCode::Forbidden
+            ));
+        }
+
         Ok(())
     }
 
@@ -546,21 +1021,7 @@ impl Account {
     /// than only logged.
     pub async fn delete_and_wait(account_id: u64) -> BichonResult<()> {
         let account = Self::get(account_id)?;
-
-        // Legal hold: an account under a hold is frozen — deleting the account
-        // would cascade-purge every message and attachment it holds, defeating
-        // the purpose of the hold. Refuse before any state is mutated. In the
-        // community edition `legal_hold` is always false, so this guard is a
-        // no-op there.
-        if account.is_on_hold() {
-            return Err(raise_error!(
-                format!(
-                    "Account {} ({}) is under a legal hold; deleting the account is disabled while the hold is active",
-                    account.id, account.email
-                ),
-                ErrorCode::Forbidden
-            ));
-        }
+        Self::ensure_deletable(&account)?;
 
         // Immediately stop scheduling to prevent new downloads
         if matches!(account.account_type, AccountType::IMAP) {
@@ -608,6 +1069,7 @@ impl Account {
         }
         OAuth2AccessToken::try_delete(account.id)?;
         UserModel::cleanup_account(account.id)?;
+        crate::archive::imap::tombstones::remove_account(account.id).await?;
         MailBox::clean(account.id)?;
         ENVELOPE_MANAGER
             .delete_account_envelopes(account.id)
@@ -721,6 +1183,54 @@ impl Account {
         )
     }
 
+    /// Apply a retention-policy change and record it in the audit trail.
+    ///
+    /// Both the direct path (dual control off) and the approval executor use
+    /// this one function, so the values written and the event emitted cannot
+    /// diverge between the two. `0` is normalized to `None` ("disabled"), the
+    /// meaning the retention sweep and the UI already use.
+    pub fn apply_retention_policy(
+        account_id: u64,
+        retention_days: Option<u64>,
+        min_retention_days: Option<u64>,
+        user: &str,
+    ) -> BichonResult<AccountModel> {
+        fn normalize(value: Option<u64>) -> Option<u64> {
+            value.filter(|days| *days > 0)
+        }
+
+        let before = Self::get(account_id)?;
+        let after_retention = normalize(retention_days);
+        let after_min = normalize(min_retention_days);
+        if normalize(before.retention_days) == after_retention
+            && normalize(before.min_retention_days) == after_min
+        {
+            return Ok(before);
+        }
+
+        let updated = update_impl(
+            DB_MANAGER.db(),
+            &account_id.to_string(),
+            move |current: Account| {
+                let mut updated = current.clone();
+                updated.retention_days = after_retention;
+                updated.min_retention_days = after_min;
+                updated.updated_at = utc_now!();
+                Ok(updated)
+            },
+        )?;
+
+        emit(crate::ext::event_bus::Event::RetentionPolicyChanged {
+            user: user.to_string(),
+            account_id,
+            retention_days_before: normalize(before.retention_days),
+            retention_days_after: after_retention,
+            min_retention_days_before: normalize(before.min_retention_days),
+            min_retention_days_after: after_min,
+        });
+        Ok(updated)
+    }
+
     /// Accounts currently under a legal hold (Enterprise feature). `None` = no
     /// accounts are held.
     pub fn list_legal_hold_accounts() -> BichonResult<Vec<AccountModel>> {
@@ -735,13 +1245,21 @@ impl Account {
         list_all_impl::<AccountModel>(DB_MANAGER.db())
     }
 
+    /// Resolve a delivery target by address. Used by the SMTP server's RCPT TO.
+    ///
+    /// **Views are skipped.** A view is commonly created with the same address
+    /// as the person it shows (the WebUI suggests it), and it never receives
+    /// mail. Without this filter a duplicate email could resolve to the view
+    /// depending on iteration order, and SMTP delivery to a real mailbox would
+    /// start failing with "not a local account". A view is not a delivery
+    /// target, so it must not shadow a real one.
     pub fn find_by_email(email: &str) -> BichonResult<Option<AccountModel>> {
         let all: Vec<AccountModel> = list_all_impl::<AccountModel>(DB_MANAGER.db())?;
         let target_email = email.trim().to_lowercase();
 
-        let first_match = all
-            .into_iter()
-            .find(|acc| acc.email.to_lowercase() == target_email);
+        let first_match = all.into_iter().find(|acc| {
+            !acc.is_view_account() && acc.email.to_lowercase() == target_email
+        });
 
         Ok(first_match)
     }
@@ -756,6 +1274,9 @@ impl Account {
                 id: account.id,
                 email: account.email,
                 name: account.account_name,
+                auth_type: account.imap.map(|imap| imap.auth.auth_type),
+                account_type: account.account_type,
+                kind: account.kind.as_ref().map(|k| k.role.clone()),
             })
             .collect::<Vec<MinimalAccount>>();
         Ok(result)
@@ -872,11 +1393,33 @@ impl Account {
         if request.extraction_rules.is_some() {
             new.extraction_rules = request.extraction_rules;
         }
+        if let Some(view) = request.view {
+            // Type and source validation happened in
+            // `validate_update_request`; assigning here keeps the view's
+            // filters editable without recreating the account (which would
+            // change its id and drop every permission granted on it).
+            new.view = Some(view);
+        }
         if request.archive_rules.is_some() {
             new.archive_rules = request.archive_rules;
         }
         if request.clear_archive_rules == Some(true) {
             new.archive_rules = None;
+        }
+        if request.override_from_headers.is_some() {
+            new.override_from_headers =
+                crate::account::payload::normalize_override_from_headers(
+                    &request.override_from_headers,
+                )
+                .map_err(|e| {
+                    raise_error!(
+                        format!("override_from_headers: {e}"),
+                        ErrorCode::InvalidParameter
+                    )
+                })?;
+        }
+        if request.clear_override_from_headers == Some(true) {
+            new.override_from_headers = None;
         }
         if request.clear_extraction_rules == Some(true) {
             new.extraction_rules = None;
@@ -887,6 +1430,18 @@ impl Account {
         if request.clear_retention_days == Some(true) {
             new.retention_days = None;
         }
+        if request.min_retention_days.is_some() {
+            new.min_retention_days = request.min_retention_days;
+        }
+        if request.clear_min_retention_days == Some(true) {
+            new.min_retention_days = None;
+        }
+        if request.remote_cleanup.is_some() {
+            new.remote_cleanup = request.remote_cleanup;
+        }
+        if request.clear_remote_cleanup == Some(true) {
+            new.remote_cleanup = None;
+        }
         new.updated_at = utc_now!();
         Ok(new)
     }
@@ -895,6 +1450,72 @@ impl Account {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Deletion guards ─────────────────────────────────────────────
+
+    /// The two account kinds that can never be deleted, and the reason the
+    /// caller gets back.
+    ///
+    /// Both branches return before the account collection is read, which is why
+    /// this test needs no database — deliberately: the third rule (a view
+    /// source) is covered by
+    /// `access::tests::views_referencing_finds_only_views_that_name_the_account`,
+    /// and a test that reached `list_all` could not run under a cargo filter
+    /// (`SETTINGS` is parsed from argv, so a filtered run has no data root).
+    #[test]
+    fn a_held_or_journal_account_is_never_deletable() {
+        let mut held = AccountModel::new(1, AccountCreateRequest::default()).unwrap();
+        held.legal_hold = true;
+        let error = AccountModel::ensure_deletable(&held).unwrap_err().to_string();
+        assert!(error.contains("legal hold"), "{error}");
+
+        let journal = AccountModel::new(
+            1,
+            AccountCreateRequest {
+                kind: Some(AccountKind {
+                    role: AccountKindRole::Journal,
+                    target_address: None,
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let error = AccountModel::ensure_deletable(&journal).unwrap_err().to_string();
+        assert!(error.contains("journal archive"), "{error}");
+    }
+
+    /// An audit record of a view edit exists only when the scope actually
+    /// moved: a rename must not leave a "view changed" line behind.
+    #[test]
+    fn view_config_change_is_recorded_only_when_the_scope_moved() {
+        let source = ViewSource {
+            account_id: 1,
+            any_participant: vec!["a@example.com".into()],
+            any_recipient: Vec::new(),
+        };
+        let narrow = ViewConfig {
+            sources: vec![source.clone()],
+        };
+        let wide = ViewConfig {
+            sources: vec![ViewSource {
+                account_id: 1,
+                any_participant: Vec::new(),
+                any_recipient: Vec::new(),
+            }],
+        };
+
+        assert!(ViewConfigChange::between(Some(&narrow), Some(&narrow)).is_none());
+        assert!(ViewConfigChange::between(None, None).is_none());
+
+        let widening = ViewConfigChange::between(Some(&narrow), Some(&wide))
+            .expect("dropping a filter is a change");
+        assert_eq!(widening.before, Some(narrow.clone()));
+        assert_eq!(widening.after, Some(wide.clone()));
+
+        // Attaching a view configuration to an account that had none.
+        let attached = ViewConfigChange::between(None, Some(&narrow)).expect("a change");
+        assert_eq!(attached.before, None);
+    }
 
     // ── Account name normalization ──────────────────────────────────
 
@@ -1355,9 +1976,7 @@ mod tests {
     static TEST_ENV: Once = Once::new();
     fn init_test_env() {
         TEST_ENV.call_once(|| {
-            let root =
-                std::env::temp_dir().join(format!("bichon-core-test-{}", std::process::id()));
-            std::fs::create_dir_all(&root).unwrap();
+            let root = crate::test_support::unique_test_root("bichon-core-test");
             std::env::set_var("BICHON_ROOT_DIR", &root);
             std::env::set_var("BICHON_ENCRYPT_PASSWORD", "test-password");
             let _ = &*SETTINGS;
@@ -1387,11 +2006,157 @@ mod tests {
             download_schedule: None,
             archive_rules: None,
             extraction_rules: None,
+            override_from_headers: None,
             retention_days: None,
+            min_retention_days: None,
+            remote_cleanup: None,
+            kind: None,
+            view: None,
         };
         let account = AccountModel::new(id, request).unwrap();
         insert_impl(DB_MANAGER.db(), account.clone()).unwrap();
         account
+    }
+
+    /// **Upgrade compatibility.** Rows written before `kind` and `view`
+    /// existed must deserialize into the current model. Both fields are
+    /// `Option` + `#[serde(default)]`, and this pins that: a backup restored
+    /// from an older release, or an in-place upgrade, must not fail to load an
+    /// account because a newer field is absent.
+    #[test]
+    fn account_rows_without_new_fields_deserialize() {
+        let account = AccountModel::new(
+            1,
+            AccountCreateRequest {
+                email: "legacy@test.example".to_string(),
+                enabled: true,
+                account_type: AccountType::NoSync,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mut value = serde_json::to_value(&account).unwrap();
+        let object = value.as_object_mut().unwrap();
+        // What an older build wrote: the keys simply are not there.
+        object.remove("kind");
+        object.remove("view");
+        object.remove("remote_cleanup");
+
+        let parsed: AccountModel = serde_json::from_value(value)
+            .expect("an account row from an older release must still parse");
+        assert!(parsed.kind.is_none());
+        assert!(parsed.view.is_none());
+        assert!(parsed.remote_cleanup.is_none());
+        assert!(matches!(parsed.account_type, AccountType::NoSync));
+    }
+
+    /// The existing storage values are part of the on-disk format: an upgrade
+    /// must read `"IMAP"` and `"NoSync"` exactly as before.
+    #[test]
+    fn account_type_storage_names_are_stable() {
+        for (value, expected) in [
+            ("\"IMAP\"", AccountType::IMAP),
+            ("\"NoSync\"", AccountType::NoSync),
+            ("\"View\"", AccountType::View),
+        ] {
+            let parsed: AccountType = serde_json::from_str(value).unwrap();
+            assert_eq!(parsed, expected);
+            assert_eq!(serde_json::to_string(&expected).unwrap(), value);
+        }
+    }
+
+    /// A view shares its address with the person it shows (the WebUI suggests
+    /// exactly that), and it never receives mail. SMTP delivery resolution must
+    /// therefore skip views, or a real mailbox could become undeliverable
+    /// depending on iteration order.
+    #[tokio::test]
+    async fn a_view_never_shadows_a_delivery_target() {
+        init_test_env();
+        let email = "shadow-check@test.example";
+
+        let view = AccountModel::new(
+            1,
+            AccountCreateRequest {
+                email: email.to_string(),
+                enabled: true,
+                account_type: AccountType::View,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        insert_impl(DB_MANAGER.db(), view).unwrap();
+        assert!(
+            AccountModel::find_by_email(email).unwrap().is_none(),
+            "a view is not a delivery target"
+        );
+
+        let local = AccountModel::new(
+            2,
+            AccountCreateRequest {
+                email: email.to_string(),
+                enabled: true,
+                account_type: AccountType::NoSync,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        insert_impl(DB_MANAGER.db(), local).unwrap();
+        let found = AccountModel::find_by_email(email)
+            .unwrap()
+            .expect("the local account must be found despite the view sharing its address");
+        assert!(matches!(found.account_type, AccountType::NoSync));
+    }
+
+    /// The REST extractor does **not** use serde: it uses the `poem_openapi`
+    /// parser generated from the field types. That parser is what rejected an
+    /// array sent to a field still typed as `Option<String>`, so the accepted
+    /// wire shape is pinned here: arrays (including empty ones) are the format,
+    /// and an absent filter defaults to an empty list.
+    #[test]
+    fn view_source_arrays_parse_through_the_openapi_parser() {
+        use poem_openapi::types::ParseFromJSON;
+
+        let parsed = <ViewSource as ParseFromJSON>::parse_from_json(Some(
+            serde_json::json!({
+                "account_id": 7,
+                "any_participant": ["a@example.com", "b@example.com"],
+                "any_recipient": []
+            }),
+        ))
+        .expect("arrays must be accepted");
+        assert_eq!(parsed.account_id, 7);
+        assert_eq!(
+            parsed.any_participant,
+            vec!["a@example.com", "b@example.com"]
+        );
+        assert!(parsed.any_recipient.is_empty());
+
+        let absent = <ViewSource as ParseFromJSON>::parse_from_json(Some(
+            serde_json::json!({ "account_id": 8 }),
+        ))
+        .expect("an absent filter must default to an empty list");
+        assert!(absent.any_participant.is_empty());
+        assert!(absent.any_recipient.is_empty());
+    }
+
+    /// An older client (or a script) that predates `kind`/`view` keeps
+    /// working: both are optional on the request.
+    #[test]
+    fn create_request_without_new_fields_parses() {
+        let request: AccountCreateRequest = serde_json::from_str(
+            r#"{"email":"legacy-client@test.example","enabled":true,"use_dangerous":false,"account_type":"NoSync"}"#,
+        )
+        .expect("a request from an older client must still parse");
+        assert!(request.kind.is_none());
+        assert!(request.view.is_none());
+        assert!(request.remote_cleanup.is_none());
+
+        let update: AccountUpdateRequest = serde_json::from_str(r#"{"enabled":false}"#)
+            .expect("an update from an older client must still parse");
+        assert!(update.view.is_none());
+        assert!(update.remote_cleanup.is_none());
+        assert!(update.clear_remote_cleanup.is_none());
     }
 
     #[tokio::test]
@@ -1402,6 +2167,7 @@ mod tests {
             enabled: true,
             account_type: AccountType::NoSync,
             retention_days: Some(90),
+            min_retention_days: None,
             ..Default::default()
         };
         let account = AccountModel::new(1, request).unwrap();
@@ -1470,5 +2236,73 @@ mod tests {
             !list.iter().any(|a| a.id == free.id),
             "free account must not be listed"
         );
+    }
+}
+
+#[cfg(test)]
+mod remote_cleanup_config_tests {
+    use super::{RemoteCleanupConfig, REMOTE_CLEANUP_FOLDER};
+
+    /// Older builds stored a `verify_mode` on the cleanup config. Verification
+    /// is now metadata-only and has no setting, so the field is gone — but a
+    /// stored account must keep loading instead of being rejected as corrupt.
+    #[test]
+    fn a_legacy_verify_mode_is_ignored() {
+        let stored = serde_json::json!({
+            "enabled": true,
+            "eligible_after_archive_days": 30,
+            "max_messages_per_run": 50,
+            "skip_flagged": true,
+            "verify_mode": "strict",
+            "some_future_field": 1
+        });
+        let config: RemoteCleanupConfig =
+            serde_json::from_value(stored).expect("older configs must still load");
+        assert!(config.enabled);
+        assert_eq!(config.max_messages_per_run, 50);
+    }
+
+    #[test]
+    fn defaults_are_conservative_and_valid() {
+        let config = RemoteCleanupConfig::default();
+        assert!(!config.enabled, "cleanup must be opt-in");
+        assert_eq!(config.eligible_after_archive_days, 30);
+        assert!(config.skip_flagged);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn a_zero_grace_period_is_allowed() {
+        // 0 means "eligible on the next run" and must stay a legal choice: the
+        // move is reversible, so an operator emptying a source mailbox that is
+        // still being archived has a real use for it.
+        let mut config = RemoteCleanupConfig::default();
+        config.eligible_after_archive_days = 0;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn per_run_cap_is_bounded() {
+        let mut config = RemoteCleanupConfig::default();
+        config.max_messages_per_run = 0;
+        assert!(config.validate().is_err());
+        config.max_messages_per_run = super::MAX_REMOTE_CLEANUP_PER_RUN + 1;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn destination_cannot_be_a_source_folder() {
+        let mut config = RemoteCleanupConfig::default();
+        config.folders = Some(vec![REMOTE_CLEANUP_FOLDER.to_string()]);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn schedule_must_be_valid_cron() {
+        let mut config = RemoteCleanupConfig::default();
+        config.schedule = Some("not a cron".into());
+        assert!(config.validate().is_err());
+        config.schedule = Some("0 0 3 * * *".into());
+        assert!(config.validate().is_ok());
     }
 }

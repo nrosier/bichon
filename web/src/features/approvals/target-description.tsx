@@ -25,6 +25,8 @@
 // sign off on it.
 import { useTranslation } from 'react-i18next'
 import type { ApprovalTarget } from '@/api/approvals/api'
+import { formatBytes } from '@/lib/utils'
+import { accountMessageCounts, filterClauses } from './target-summary'
 
 /** The blast radius, phrased as what will be destroyed.
  *
@@ -37,6 +39,18 @@ export function TargetDescription({ target }: { target: ApprovalTarget }) {
   const { t } = useTranslation()
 
   switch (target.kind) {
+    case 'hold_case':
+      return (
+        <div>
+          <div className='font-medium'>
+            {target.case_ref || target.hold_id}
+          </div>
+          <div className='text-muted-foreground'>
+            {t('legalHold.account', 'Account')} {target.account_id}
+          </div>
+        </div>
+      )
+
     case 'accounts':
       return (
         <div>
@@ -86,7 +100,16 @@ export function TargetDescription({ target }: { target: ApprovalTarget }) {
       )
 
     case 'messages': {
-      const accounts = Object.keys(target.by_account)
+      const counts = accountMessageCounts(target)
+      const accounts =
+        counts.length > 0
+          ? counts.map((c) => String(c.account_id))
+          : (target.account_ids ?? []).map(String)
+      const clauses = filterClauses(target.filter)
+      const frozenBytes =
+        typeof target.detail_bytes === 'number' && target.detail_bytes > 0
+          ? target.detail_bytes
+          : null
       return (
         <div>
           <div className='font-medium'>
@@ -104,6 +127,36 @@ export function TargetDescription({ target }: { target: ApprovalTarget }) {
               }
             )}
           </div>
+          {counts.length > 0 && (
+            <ul className='mt-1 space-y-0.5 text-xs text-muted-foreground'>
+              {counts.map((c) => (
+                <li key={c.account_id}>
+                  {t(
+                    'approvals.targetMessagesAccountLine',
+                    'Account {{account}}: {{count}} message(s)',
+                    { account: c.account_id, count: c.count }
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+          {clauses.length > 0 && (
+            <div className='mt-1 text-xs text-muted-foreground'>
+              <span>{t('approvals.targetMessagesFilter', 'Search filter')}: </span>
+              <code className='break-all'>
+                {clauses.map((c) => `${c.field}: ${c.value}`).join('; ')}
+              </code>
+            </div>
+          )}
+          {frozenBytes !== null && (
+            <div className='mt-1 text-xs text-muted-foreground'>
+              {t(
+                'approvals.targetMessagesFrozen',
+                'The exact ids are frozen in a detail file ({{size}}). Mail that arrives after the request was made is NOT included.',
+                { size: formatBytes(frozenBytes) }
+              )}
+            </div>
+          )}
         </div>
       )
     }
@@ -116,6 +169,94 @@ export function TargetDescription({ target }: { target: ApprovalTarget }) {
             {t('approvals.targetToken', 'API token {{fingerprint}}', {
               fingerprint: target.fingerprint,
             })}
+          </div>
+        </div>
+      )
+
+    case 'retention': {
+      const days = (value: number | null) =>
+        value === null
+          ? t('approvals.retentionOff', 'off')
+          : t('approvals.retentionDays', '{{count}} days', { count: value })
+      return (
+        <div>
+          <div className='font-medium'>
+            {t('approvals.targetRetention', 'Retention policy — account {{account}}', {
+              account: target.account_id,
+            })}
+          </div>
+          <div className='text-muted-foreground'>
+            {t('approvals.retentionMax', 'Maximum retention: {{before}} → {{after}}', {
+              before: days(target.retention_days_before),
+              after: days(target.retention_days_after),
+            })}
+          </div>
+          <div className='text-muted-foreground'>
+            {t('approvals.retentionLock', 'Deletion lock: {{before}} → {{after}}', {
+              before: days(target.min_retention_days_before),
+              after: days(target.min_retention_days_after),
+            })}
+          </div>
+        </div>
+      )
+    }
+
+    case 'erasure': {
+      const accounts = Object.keys(target.by_account)
+      return (
+        <div>
+          <div className='font-medium'>
+            {t('approvals.targetErasure', 'GDPR erasure — {{subject}}', {
+              subject: target.subject,
+            })}
+          </div>
+          <div className='text-muted-foreground'>
+            {t(
+              'approvals.targetErasureCount',
+              '{{count}} message(s) across {{accounts}} account(s), identified by: {{criteria}}',
+              {
+                count: target.messages,
+                accounts: accounts.length,
+                criteria: target.criteria,
+              }
+            )}
+          </div>
+          {/* The requester's assessment is shown on the card, not hidden behind
+              a detail view: it is the half of the argument the approver is
+              being asked to accept. */}
+          <div className='text-muted-foreground italic'>{target.assessment}</div>
+        </div>
+      )
+    }
+
+    case 'export':
+      return (
+        <div>
+          <div className='font-medium'>{target.saved_search_name}</div>
+          <div className='text-muted-foreground'>
+            {t(
+              'approvals.targetExport',
+              'Export approximately {{count}} message(s) as {{format}}',
+              { count: target.messages, format: target.format }
+            )}
+          </div>
+          {/* The scope is the part the approver is actually signing off on:
+              a request queued by an administrator covers every account, one
+              from a scoped role covers a named subset. `null` is the unscoped
+              form — the server sends it rather than an empty list, so an empty
+              list here would mean "no accounts", which is not a state the
+              backend produces. */}
+          <div className='text-muted-foreground'>
+            {target.account_ids === null
+              ? t('approvals.targetExportAllAccounts', 'from all accounts')
+              : t(
+                  'approvals.targetExportAccounts',
+                  'from {{count}} account(s): {{ids}}',
+                  {
+                    count: target.account_ids.length,
+                    ids: target.account_ids.slice(0, 5).join(', '),
+                  }
+                )}
           </div>
         </div>
       )

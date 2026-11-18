@@ -1,11 +1,13 @@
-use std::{path::PathBuf, time::Instant};
+use std::{
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 use bytes::Bytes;
-use mail_parser::MimeHeaders;
 
 use bichon_core::{
     envelope::extractor::extract_references, message::content::AttachmentInfo,
-    store::tantivy::tokenizers::EuroTokenizer, utils::compute_content_hash,
+    store::tantivy::tokenizers::{tri_analyzer, EuroTokenizer}, utils::compute_content_hash,
 };
 
 use bichon_blob::{Codec, Config, Engine};
@@ -15,7 +17,11 @@ use uuid::Uuid;
 
 use bichon_core::{
     common::AddrVec,
-    envelope::extractor::{compute_thread_id, generate_message_id},
+    envelope::extractor::{
+        attachment_parts, compute_thread_id, first_body_html, first_body_text,
+        generate_message_id, resolve_sender,
+    },
+    archive::imap::stable_uid::AccountUidAssigner,
     error::{code::ErrorCode, BichonResult},
     raise_error,
     store::envelope::Envelope,
@@ -76,77 +82,36 @@ pub fn detach_attachments_standalone(
     original_body: &[u8],
     message: &mail_parser::Message<'_>,
 ) -> (Vec<u8>, DetachOutput) {
-    let mut stripped_eml = original_body.to_vec();
-    let mut infos = Vec::new();
-    let mut blobs = Vec::new();
-
-    let mut ranges: Vec<_> = message
-        .attachments()
-        .map(|att| {
-            (
-                att.raw_body_offset() as usize,
-                att.raw_end_offset() as usize,
-                att,
-            )
-        })
-        .collect();
-    ranges.sort_by(|a, b| b.0.cmp(&a.0));
-
-    for (raw_start, raw_end, att) in ranges {
-        let content_hash = compute_content_hash(att.contents());
-        let body_len = original_body.len();
-        let raw_start = raw_start.min(body_len);
-        let raw_end = raw_end.min(body_len);
-        let range_valid = raw_start < raw_end;
-
-        if range_valid {
-            blobs.push((
-                content_hash.clone(),
-                Bytes::copy_from_slice(&original_body[raw_start..raw_end]),
-            ));
-        }
-
-        if range_valid {
-            let placeholder = format!("<<BICHON_DETACH_HASH:{}>>", &content_hash);
-            stripped_eml.splice(raw_start..raw_end, placeholder.as_bytes().iter().cloned());
-        }
-
-        infos.push(AttachmentInfo {
-            filename: att.attachment_name().map(|n| n.to_string()),
-            size: att.contents().len(),
-            inline: att
-                .content_disposition()
-                .map(|d| d.is_inline())
-                .unwrap_or_else(|| att.content_id().is_some()),
-            file_type: att
-                .content_type()
-                .map(|ct| {
-                    format!(
-                        "{}/{}",
-                        ct.c_type.as_ref(),
-                        ct.c_subtype.as_deref().unwrap_or("")
-                    )
-                })
-                .unwrap_or_else(|| "application/octet-stream".to_string()),
-            content_id: att.content_id().map(|id| id.to_string()),
-            content_hash,
-            is_message: att.is_message(),
-            extracted_text: None,
-            extracted_page_count: None,
-            extracted_is_ocr: false,
-        });
-    }
-
-    (stripped_eml, DetachOutput { infos, blobs })
+    // Delegate to the single canonical implementation shared with the live
+    // ingest path, so a migrated store always matches what the runtime
+    // writes and reads back. No extraction filter: offline migration does
+    // not run text extraction.
+    let detached = bichon_core::envelope::extractor::strip_attachment_bodies(
+        original_body,
+        message,
+        None,
+    );
+    (
+        detached.stripped_eml,
+        DetachOutput {
+            infos: detached.infos,
+            blobs: detached.blobs,
+        },
+    )
 }
 
 pub struct NewIndexWriterV2 {
     pub envelope_writer: Option<IndexWriter>,
     pub attachment_writer: Option<IndexWriter>,
     pub engine: Engine,
+    envelope_dir: PathBuf,
+    attachment_dir: PathBuf,
     pending: usize,
     email_buf: Vec<([u8; 32], Vec<u8>)>,
     attachment_buf: Vec<([u8; 32], Vec<u8>)>,
+    /// Per-account stable IMAP UID counter for the documents written here. The
+    /// legacy store had no such concept, so every document gets a fresh number.
+    uid_assigner: AccountUidAssigner,
 }
 
 impl NewIndexWriterV2 {
@@ -170,6 +135,9 @@ impl NewIndexWriterV2 {
         envelope_index
             .tokenizers()
             .register("euro", EuroTokenizer::new());
+        envelope_index
+            .tokenizers()
+            .register("tri", tri_analyzer());
 
         let envelope_writer = envelope_index
             .writer_with_num_threads(3, 256 * 1024 * 1024)
@@ -195,6 +163,9 @@ impl NewIndexWriterV2 {
         attachment_index
             .tokenizers()
             .register("euro", EuroTokenizer::new());
+        attachment_index
+            .tokenizers()
+            .register("tri", tri_analyzer());
         let attachment_writer = attachment_index
             .writer_with_num_threads(3, 256 * 1024 * 1024)
             .map_err(|e| raise_error!(format!("{e:#?}"), ErrorCode::InternalError))?;
@@ -219,9 +190,12 @@ impl NewIndexWriterV2 {
             envelope_writer: Some(envelope_writer),
             attachment_writer: Some(attachment_writer),
             engine,
+            envelope_dir: dirs.envelope_dir,
+            attachment_dir: dirs.attachment_dir,
             pending: 0,
             email_buf: Vec::new(),
             attachment_buf: Vec::new(),
+            uid_assigner: AccountUidAssigner::new(),
         })
     }
 
@@ -240,23 +214,20 @@ impl NewIndexWriterV2 {
             .parse(eml_bytes)
             .ok_or_else(|| raise_error!("failed to parse eml".into(), ErrorCode::InternalError))?;
 
-        if message.parts.is_empty() {
+        if message.parts().next().is_none() {
             return Err(raise_error!(
                 "Malformed or completely empty EML (no parts found)".into(),
                 ErrorCode::InternalError
             ));
         }
         // ── text / preview ────────────────────────────────────────────────
-        let text = message
-            .body_text(0)
-            .map(|c| c.into_owned())
+        let text = first_body_text(&message)
             .or_else(|| {
-                message
-                    .body_html(0)
-                    .map(|html| bichon_core::utils::html::extract_text(html.into_owned()))
+                first_body_html(&message)
+                    .map(|html| bichon_core::utils::html::extract_text(&html))
             })
             .unwrap_or_default();
-        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let text = bichon_core::utils::normalize_whitespace(&text);
         let preview = if text.chars().count() > 100 {
             text.chars().take(100).collect::<String>() + "..."
         } else {
@@ -269,7 +240,9 @@ impl NewIndexWriterV2 {
             .map(String::from)
             .unwrap_or_else(generate_message_id);
 
-        let in_reply_to = message.in_reply_to().as_text().map(String::from);
+        let in_reply_to = message
+            .in_reply_to()
+            .and_then(|list| list.last().map(String::from));
         let references = extract_references(&message);
         let thread_id = compute_thread_id(in_reply_to, references, &message_id);
 
@@ -281,7 +254,7 @@ impl NewIndexWriterV2 {
             internal_date
         };
 
-        let parse_addrs = |addrs: Option<&mail_parser::Address<'_>>| {
+        let parse_addrs = |addrs: Option<mail_parser::AddressList<'_>>| {
             addrs
                 .map(|addr| {
                     AddrVec::from(addr)
@@ -293,10 +266,16 @@ impl NewIndexWriterV2 {
                 .unwrap_or_default()
         };
 
-        let from = message
-            .from()
-            .and_then(|addr| AddrVec::from(addr).0.into_iter().next())
-            .and_then(|a| a.address)
+        // Offline migration never applies account sender-override rules: a
+        // v0.3.7 account predates `override_from_headers` (the migration
+        // converts every account with the field set to `None`). Reading the
+        // account here through `AccountModel` would lazily initialise the
+        // global `DB_MANAGER`, whose Tokio workers panic in `bichon-admin`'s
+        // interactive menu — that menu runs without a Tokio runtime.
+        let sender = resolve_sender(&message, None);
+        let from = sender
+            .address
+            .clone()
             .unwrap_or_else(|| "unknown".to_string());
         let to = parse_addrs(message.to());
         let cc = parse_addrs(message.cc());
@@ -333,6 +312,8 @@ impl NewIndexWriterV2 {
                     subject: subject.clone(),
                     content_hash: a.content_hash.clone(),
                     from: from.clone(),
+                    from_name: sender.name.clone(),
+                    wire_from: sender.wire_from.clone(),
                     date,
                     ingest_at: now,
                     size: a.size as u64,
@@ -360,9 +341,16 @@ impl NewIndexWriterV2 {
             account_id,
             mailbox_id,
             uid,
+            // The legacy store predates stable UIDs: assign one from the
+            // per-account counter (write-once from here on).
+            imap_uid: self.uid_assigner.assign(account_id)?,
+            // The legacy store never tracked cleanup moves.
+            cleanup_moved: false,
             subject,
             preview,
             from,
+            from_name: sender.name,
+            wire_from: sender.wire_from,
             to,
             cc,
             bcc,
@@ -371,7 +359,7 @@ impl NewIndexWriterV2 {
             ingest_at: now,
             size: eml_bytes.len() as u32,
             thread_id,
-            attachment_count: message.attachment_count(),
+            attachment_count: attachment_parts(&message).count(),
             regular_attachment_count: attachment_docs.len(),
             tags: None,
             account_email: None,
@@ -429,6 +417,17 @@ impl NewIndexWriterV2 {
         Ok(())
     }
 
+    /// Persist the per-account stable UID counters this migration produced.
+    ///
+    /// Call it after [`Self::finish_writers`] (the index must be durable before
+    /// the counter claims the numbers in it) and before the engine shuts down.
+    /// `root` is the migration's `--bichon-root-dir`, whose `memdb/` the
+    /// metadata step already created.
+    pub fn finish_uids(&mut self, root: &Path) -> BichonResult<()> {
+        let db = bichon_core::admin::meta::open_database(root.join("memdb"))?;
+        self.uid_assigner.finish(&db)
+    }
+
     /// Final commit + segment merge for Tantivy writers (called once at end).
     pub fn finish_writers(&mut self) -> BichonResult<()> {
         self.commit_tantivy()?;
@@ -453,6 +452,15 @@ impl NewIndexWriterV2 {
                 let start = std::time::Instant::now();
                 let _ = writer.wait_merging_threads();
                 println!("{} merge done: {:#?}", name, start.elapsed());
+            }
+        }
+
+        // Migration builds the indexes with the current binary, so stamp the
+        // current index format version (otherwise the server would treat the
+        // freshly built indexes as legacy on startup).
+        for dir in [&self.envelope_dir, &self.attachment_dir] {
+            if let Err(e) = bichon_core::store::tantivy::format::write_index_format_version(dir) {
+                tracing::warn!(error = %e, "failed to write INDEX_FORMAT marker for {:?}", dir);
             }
         }
 
@@ -565,5 +573,136 @@ impl NewIndexWriterV2 {
             )
         })?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bichon_core::account::migration::{Account, AccountType};
+    use bichon_core::database::MemDbModel;
+
+    fn temp_root(prefix: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join("bichon-migrate-v2-test")
+            .join(prefix)
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn new_dirs(root: &std::path::Path) -> NewDirs {
+        NewDirs {
+            envelope_dir: root.join("bichon-indices").join("mail_metadata"),
+            attachment_dir: root.join("bichon-indices").join("attachment_metadata"),
+            storage_dir: root.join("bichon-storage"),
+        }
+    }
+
+    /// The stable UIDs the migrated documents carry, read from the new index.
+    fn stored_imap_uids(dir: &std::path::Path, account_id: u64) -> Vec<u64> {
+        use tantivy::collector::TopDocs;
+        use tantivy::query::AllQuery;
+        use tantivy::schema::Value;
+
+        let index = Index::open_in_dir(dir).expect("open migrated envelope index");
+        let reader = index.reader().expect("reader");
+        reader.reload().expect("reload");
+        let searcher = reader.searcher();
+        let hits = searcher
+            .search(&AllQuery, &TopDocs::with_limit(64).order_by_score())
+            .expect("search");
+        let fields = SchemaTools::email_fields();
+        let mut uids: Vec<u64> = hits
+            .iter()
+            .filter_map(|(_, addr)| {
+                let doc: TantivyDocument = searcher.doc(*addr).ok()?;
+                if doc
+                    .get_first(fields.f_account_id)
+                    .and_then(|v| v.as_u64())
+                    != Some(account_id)
+                {
+                    return None;
+                }
+                doc.get_first(fields.f_imap_uid)
+                    .and_then(|v| v.as_u64())
+            })
+            .collect();
+        uids.sort_unstable();
+        uids
+    }
+
+    fn eml(message_id: &str) -> Vec<u8> {
+        format!(
+            "From: alice@example.com\r\n\
+             To: bob@example.com\r\n\
+             Subject: migrated\r\n\
+             Date: Thu, 01 Jan 2023 00:00:00 +0000\r\n\
+             Message-ID: <{message_id}>\r\n\
+             \r\n\
+             body of the legacy message\r\n"
+        )
+        .into_bytes()
+    }
+
+    /// The v0.3.7 migration writes documents by hand, so it is the one ingest
+    /// path that does not go through the extractor. It must still give every
+    /// document a distinct stable UID and leave the account counter above them —
+    /// otherwise the first post-migration ingest would reissue a number.
+    ///
+    /// Deliberately a plain `#[test]`, not `#[tokio::test]`: `bichon-admin`'s
+    /// interactive menu runs the migration without a Tokio runtime, so touching
+    /// the global `DB_MANAGER` here (whose workers call `tokio::spawn`) would
+    /// panic in production. Keeping this test runtime-free guards that.
+    #[test]
+    fn ingest_assigns_distinct_stable_uids_and_persists_the_counter() {
+        let root = temp_root("uids");
+        let account_id = 1u64;
+        let mut writer = NewIndexWriterV2::open(new_dirs(&root)).expect("open writer");
+
+        writer
+            .ingest(&eml("migrate-1@x"), account_id, 10, 1, 0)
+            .expect("ingest 1");
+        writer
+            .ingest(&eml("migrate-2@x"), account_id, 10, 2, 0)
+            .expect("ingest 2");
+        writer.finish_writers().expect("finish writers");
+
+        assert_eq!(
+            stored_imap_uids(&writer.envelope_dir, account_id),
+            vec![1, 2],
+            "every migrated document needs its own stable UID"
+        );
+
+        // The counter has nowhere to live without the account row the metadata
+        // step creates, so seed it before finishing.
+        let db_path = root.join("memdb");
+        let seed = bichon_core::admin::meta::open_database(&db_path).unwrap();
+        seed.collection(Account::collection())
+            .upsert(
+                &account_id.to_string(),
+                &Account {
+                    id: account_id,
+                    account_type: AccountType::IMAP,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        writer.finish_uids(&root).expect("persist counters");
+
+        let db = bichon_core::admin::meta::open_database(&db_path).unwrap();
+        let account: Account = db
+            .collection(Account::collection())
+            .get(&account_id.to_string())
+            .unwrap()
+            .expect("account row");
+        assert_eq!(
+            account.imap_uid_next, 3,
+            "the counter must sit above every UID the migration handed out"
+        );
+
+        writer.shutdown_engine().ok();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

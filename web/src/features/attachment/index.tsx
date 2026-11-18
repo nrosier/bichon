@@ -31,6 +31,7 @@ import { EnvelopeDeleteDialog } from './delete-dialog'
 import { MailDisplayDrawer } from './mail-display-dialog'
 import { AttachmentListTable } from './mail-list-table'
 import { NestedEmailDialog } from './nested-email-dialog'
+import { RepairMessageDialog } from '@/features/repair/repair-message-dialog'
 import { RestoreMessageDialog } from './restore-message-dialog'
 
 export default function AttachmentSearch() {
@@ -40,9 +41,6 @@ export default function AttachmentSearch() {
   >(undefined)
   const [open, setOpen] = useDialogState<AttachmentDialogType>(null)
   const [toDelete, setToDelete] = React.useState<Map<number, Set<string>>>(
-    new Map()
-  )
-  const [selected, setSelected] = React.useState<Map<number, Set<string>>>(
     new Map()
   )
   const [selectedTags, setSelectedTags] = React.useState<string[]>([])
@@ -101,8 +99,6 @@ export default function AttachmentSearch() {
             setCurrentAttachment,
             toDelete,
             setToDelete,
-            selected,
-            setSelected,
             sorting,
             setSorting,
             filter,
@@ -169,6 +165,15 @@ export default function AttachmentSearch() {
             key='attachment-restore-mail-dialog'
             open={open === 'restore'}
             onOpenChange={() => setOpen('restore')}
+          />
+
+          <RepairMessageDialog
+            key='attachment-repair-mail-dialog'
+            open={open === 'repair'}
+            onOpenChange={() => setOpen('repair')}
+            accountId={currentAttachment?.account_id}
+            envelopeId={currentAttachment?.envelope_id}
+            subject={currentAttachment?.subject}
           />
 
           <NestedEmailDialog
