@@ -21,6 +21,7 @@ import { AxiosError } from 'axios'
 import { useLocation, useNavigate } from '@tanstack/react-router'
 import { useTranslation } from 'react-i18next'
 import { setToken } from '@/stores/authStore'
+import { isTheme } from '@/lib/theme'
 import { toSearchParams } from '@/lib/utils'
 import { toast } from '@/hooks/use-toast'
 import { ToastAction } from '@/components/ui/toast'
@@ -99,7 +100,7 @@ export function useSsoSignIn(redirect: string): SsoSignIn {
   const applyLogin = (result: OidcHandoffResult, target: string) => {
     setToken(result)
 
-    if (result.theme) {
+    if (isTheme(result.theme)) {
       setTheme(result.theme)
     }
 
