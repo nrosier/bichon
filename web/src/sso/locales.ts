@@ -19,9 +19,13 @@
 /**
  * Translations for the SSO strings, kept out of `src/locales/*.json`.
  *
- * Those 18 files are upstream's, and upstream edits them often — adding eight
- * keys to each would make every resync a conflict in all eighteen. Registering
+ * Those files are upstream's, and upstream edits them often — adding eight
+ * keys to each would make every resync a conflict in all of them. Registering
  * them from here instead leaves them untouched.
+ *
+ * The exception is the `sso.error.<code>` messages for the stable OIDC error
+ * codes. Those are in the JSON files, because the sign-in form looks them up by
+ * key like any other message. `ssoErrorKey` maps a code to its key.
  *
  * Language keys and the `translation` namespace match what `@/i18n` sets up.
  * `en.ssoLogin` is upstream's own string (their paid edition has an SSO button
@@ -241,3 +245,51 @@ const SSO_TRANSLATIONS: Record<string, SsoStrings> = {
 Object.entries(SSO_TRANSLATIONS).forEach(([language, strings]) => {
   i18n.addResourceBundle(language, 'translation', { auth: strings }, true, false)
 })
+
+/**
+ * The OIDC error codes the server redirects with as `?oidc_error=<code>`. The
+ * server sends only the code, so the sign-in form turns it into text here.
+ * Keep this list in step with the backend's codes.
+ */
+const SSO_ERROR_CODES = [
+  'sso_unavailable',
+  'sso_start_failed',
+  'sso_failed',
+  'sso_declined',
+  'sso_incomplete',
+  'sso_state_invalid',
+  'sso_no_email',
+  'sso_link_disabled',
+  'sso_link_unverified_email',
+  'email_domain_not_allowed',
+  'discovery_invalid_issuer',
+  'discovery_dns',
+  'discovery_connection_refused',
+  'discovery_timeout',
+  'discovery_tls',
+  'discovery_network',
+  'discovery_redirect',
+  'discovery_not_found',
+  'discovery_access_denied',
+  'discovery_server_error',
+  'discovery_http_error',
+  'discovery_not_json',
+  'discovery_incomplete',
+  'discovery_issuer_mismatch',
+] as const
+
+export type SsoErrorCode = (typeof SSO_ERROR_CODES)[number]
+
+export const SSO_ERROR_KEYS: Record<SsoErrorCode, string> = Object.fromEntries(
+  SSO_ERROR_CODES.map((code) => [code, `sso.error.${code}`])
+) as Record<SsoErrorCode, string>
+
+/**
+ * The i18n key for a known `oidc_error` code, or `undefined` for anything else.
+ * Unknown codes are not mapped to a default: the caller decides what to show.
+ */
+export function ssoErrorKey(code: string): string | undefined {
+  return Object.prototype.hasOwnProperty.call(SSO_ERROR_KEYS, code)
+    ? SSO_ERROR_KEYS[code as SsoErrorCode]
+    : undefined
+}

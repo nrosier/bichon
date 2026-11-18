@@ -3433,5 +3433,32 @@
     "singleRequestBatchSizeMustBeNumber": "Размер пакета должен быть числом",
     "singleRequestBatchSizeTooLarge": "Размер пакета должен быть не более 200",
     "singleRequestBatchSizeTooSmall": "Размер пакета должен быть не менее 10"
-  }
-}
+  },
+  "sso": {
+    "error": {
+      "sso_unavailable": "Single sign-on is unavailable right now. Sign in with your local account, or try again later.",
+      "sso_start_failed": "Bichon could not start the sign-in with your identity provider. Try again, or ask an administrator to check the single sign-on settings.",
+      "sso_failed": "Single sign-on failed. Try again, or sign in with your local account.",
+      "sso_declined": "The identity provider declined the sign-in. Try again and approve the request.",
+      "sso_incomplete": "The sign-in did not complete. Try again.",
+      "sso_state_invalid": "The sign-in session expired or did not match. Start the sign-in again.",
+      "sso_no_email": "Your identity provider did not return an email address. Ask an administrator to check the attributes sent for your account.",
+      "sso_link_disabled": "Linking to an existing account by email is turned off. Sign in with your local account, or ask an administrator.",
+      "sso_link_unverified_email": "Your identity provider has not verified this email address, so it cannot be linked to an existing account. Verify it with your provider, or ask an administrator.",
+      "email_domain_not_allowed": "Your email domain is not allowed to sign in. Use an account from an allowed domain, or ask an administrator.",
+      "discovery_invalid_issuer": "The identity provider address is not valid. Ask an administrator to check the issuer URL.",
+      "discovery_dns": "Bichon could not find the identity provider's server name. Ask an administrator to check the issuer URL.",
+      "discovery_connection_refused": "The identity provider refused the connection. Check that it is running, or ask an administrator.",
+      "discovery_timeout": "The identity provider did not respond in time. Try again shortly, or ask an administrator.",
+      "discovery_tls": "Bichon could not establish a secure connection to the identity provider. Ask an administrator to check its certificate.",
+      "discovery_network": "Bichon could not reach the identity provider over the network. Ask an administrator to check the connection.",
+      "discovery_redirect": "The identity provider redirected Bichon to an unexpected address. Ask an administrator to check the issuer URL.",
+      "discovery_not_found": "The identity provider's configuration was not found. Ask an administrator to check the issuer URL.",
+      "discovery_access_denied": "The identity provider refused access to its configuration. Ask an administrator to check the provider's access settings.",
+      "discovery_server_error": "The identity provider reported a server error. Try again later, or ask an administrator.",
+      "discovery_http_error": "The identity provider returned an unexpected HTTP response. Try again later, or ask an administrator.",
+      "discovery_not_json": "The identity provider's configuration was not in the expected format. Ask an administrator to check the issuer URL.",
+      "discovery_incomplete": "The identity provider's configuration is incomplete. Ask an administrator to check the provider's settings.",
+      "discovery_issuer_mismatch": "The identity provider's reported address does not match the configured issuer. Ask an administrator to check the issuer URL."
+    }
+  }}

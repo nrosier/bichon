@@ -132,21 +132,13 @@ export function useSsoSignIn(redirect: string): SsoSignIn {
   const redeemed = useRef(false)
   const startedRedirect = useRef(false)
 
+  // The message itself is shown by the sign-in form's shared error effect, which
+  // maps the code to text. This only drops the code from the URL so a refresh
+  // does not replay it.
   useEffect(() => {
     if (!oidcError || notifiedError.current) return
     notifiedError.current = true
 
-    toast({
-      variant: 'destructive',
-      title: t('auth.ssoFailed', 'Single sign-on failed'),
-      description: oidcError,
-      action: (
-        <ToastAction altText={t('common.tryAgain')}>
-          {t('common.tryAgain')}
-        </ToastAction>
-      ),
-    })
-    // Drop the message from the URL so a refresh does not replay it.
     backToForm()
   }, [oidcError])
 
