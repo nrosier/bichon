@@ -23,7 +23,7 @@ use tracing::{info, warn};
 use crate::database::manager::DB_MANAGER;
 use crate::database::{filter_impl, insert_impl, update_impl};
 use crate::error::code::ErrorCode;
-use crate::error::BichonResult;
+use crate::error::{BichonError, BichonResult};
 use crate::oidc::config::OidcConfig;
 use crate::oidc::SSO_PROVIDER;
 use crate::users::role::{UserRole, DEFAULT_MEMBER_ROLE_ID};
@@ -61,6 +61,76 @@ pub enum Resolution {
     Provisioned,
 }
 
+/// Why an identity could not be resolved to a user.
+#[derive(Debug)]
+pub enum ResolveError {
+    /// An account with the same email exists, and linking by email is off.
+    LinkDisabled,
+    /// An account with the same email exists, but the provider does not assert
+    /// `email_verified=true` for the address.
+    LinkUnverifiedEmail,
+    /// No email was supplied, so a new account cannot be provisioned.
+    NoEmail,
+    /// Anything else: a database failure, or no free username.
+    Internal(BichonError),
+}
+
+const LINK_DISABLED_MESSAGE: &str = "An account with this email address already exists in Bichon, and \
+     linking accounts by email is switched off. An administrator can set \
+     BICHON_OIDC_LINK_BY_EMAIL=true to allow it, or change the address on \
+     the existing account so a separate one is created instead.";
+
+const LINK_UNVERIFIED_MESSAGE: &str = "An account with this email address already exists in Bichon, but the \
+     identity provider does not confirm that this address has been verified, \
+     so the two cannot be linked automatically. Have the address verified at \
+     the provider, or change the address on the existing Bichon account so a \
+     separate one is created instead.";
+
+const NO_EMAIL_MESSAGE: &str = "The identity provider returned no email address for this user, so an account cannot be created. Grant the 'email' scope to the Bichon client, or create the user in Bichon first.";
+
+impl ResolveError {
+    /// Stable machine code for the sign-in page.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::LinkDisabled => "sso_link_disabled",
+            Self::LinkUnverifiedEmail => "sso_link_unverified_email",
+            Self::NoEmail => "sso_no_email",
+            Self::Internal(_) => "sso_failed",
+        }
+    }
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LinkDisabled => f.write_str(LINK_DISABLED_MESSAGE),
+            Self::LinkUnverifiedEmail => f.write_str(LINK_UNVERIFIED_MESSAGE),
+            Self::NoEmail => f.write_str(NO_EMAIL_MESSAGE),
+            Self::Internal(e) => write!(f, "{}", e),
+        }
+    }
+}
+
+impl std::error::Error for ResolveError {}
+
+impl From<BichonError> for ResolveError {
+    fn from(e: BichonError) -> Self {
+        Self::Internal(e)
+    }
+}
+
+impl From<ResolveError> for BichonError {
+    fn from(e: ResolveError) -> Self {
+        match e {
+            ResolveError::LinkDisabled | ResolveError::LinkUnverifiedEmail => {
+                raise_error!(e.to_string(), ErrorCode::PermissionDenied)
+            }
+            ResolveError::NoEmail => raise_error!(e.to_string(), ErrorCode::InvalidParameter),
+            ResolveError::Internal(inner) => inner,
+        }
+    }
+}
+
 /// Find the user behind a verified identity, creating one if necessary.
 ///
 /// Lookup order (`docs/OIDC.md`, "User resolution"): `(sso_provider, sso_id)`,
@@ -70,6 +140,15 @@ pub fn resolve_or_provision(
     identity: &SsoIdentity,
     config: &OidcConfig,
 ) -> BichonResult<(UserModel, Resolution)> {
+    resolve_or_provision_coded(identity, config).map_err(BichonError::from)
+}
+
+/// [`resolve_or_provision`] with a classified error, so the caller can report
+/// a stable code instead of a sentence.
+pub fn resolve_or_provision_coded(
+    identity: &SsoIdentity,
+    config: &OidcConfig,
+) -> Result<(UserModel, Resolution), ResolveError> {
     let subject = identity.subject.clone();
     let existing = filter_impl::<UserModel, _>(DB_MANAGER.db(), move |u| {
         u.sso_provider.as_deref() == Some(SSO_PROVIDER) && u.sso_id.as_deref() == Some(&subject)
@@ -93,7 +172,7 @@ pub fn resolve_or_provision(
                     "refusing to link the OIDC identity '{}' to existing user '{}' by email <{}>: {}",
                     identity.subject, user.username, email, refusal.log
                 );
-                return Err(raise_error!(refusal.user_facing.into(), ErrorCode::PermissionDenied));
+                return Err(refusal.error);
             }
             let linked = link_to_sso(&user, &identity.subject)?;
             info!(
@@ -112,14 +191,14 @@ pub fn resolve_or_provision(
     Ok((user, Resolution::Provisioned))
 }
 
-/// Why a link was refused: one message for the operator, one for the browser.
+/// Why a link was refused: one message for the operator, plus the classified
+/// error. The error's message deliberately says nothing about the account that
+/// was matched: the person seeing it authenticated at the provider, not at
+/// Bichon, so naming the Bichon username would confirm it exists to someone who
+/// has not proved they own it.
 struct LinkRefusal {
     log: &'static str,
-    /// Deliberately says nothing about the account that was matched. The person
-    /// reading it authenticated at the provider, not at Bichon, so naming the
-    /// Bichon username would confirm it exists to someone who has not proved
-    /// they own it.
-    user_facing: &'static str,
+    error: ResolveError,
 }
 
 /// Whether a provider-asserted email may adopt an existing Bichon account.
@@ -138,21 +217,14 @@ fn link_check(identity: &SsoIdentity, link_by_email: bool) -> Option<LinkRefusal
     if !link_by_email {
         return Some(LinkRefusal {
             log: "BICHON_OIDC_LINK_BY_EMAIL is not enabled",
-            user_facing: "An account with this email address already exists in Bichon, and \
-                          linking accounts by email is switched off. An administrator can set \
-                          BICHON_OIDC_LINK_BY_EMAIL=true to allow it, or change the address on \
-                          the existing account so a separate one is created instead.",
+            error: ResolveError::LinkDisabled,
         });
     }
 
     if identity.email_verified != Some(true) {
         return Some(LinkRefusal {
             log: "the provider did not assert email_verified=true for the address",
-            user_facing: "An account with this email address already exists in Bichon, but the \
-                          identity provider does not confirm that this address has been verified, \
-                          so the two cannot be linked automatically. Have the address verified at \
-                          the provider, or change the address on the existing Bichon account so a \
-                          separate one is created instead.",
+            error: ResolveError::LinkUnverifiedEmail,
         });
     }
 
@@ -179,19 +251,13 @@ fn link_to_sso(user: &UserModel, subject: &str) -> BichonResult<UserModel> {
     })
 }
 
-fn provision(identity: &SsoIdentity, default_role_id: u64) -> BichonResult<UserModel> {
+fn provision(identity: &SsoIdentity, default_role_id: u64) -> Result<UserModel, ResolveError> {
     let email = identity
         .email
         .as_deref()
         .map(str::trim)
         .filter(|e| !e.is_empty())
-        .ok_or_else(|| {
-            raise_error!(
-                "The identity provider returned no email address for this user, so an account cannot be created. Grant the 'email' scope to the Bichon client, or create the user in Bichon first."
-                    .into(),
-                ErrorCode::InvalidParameter
-            )
-        })?
+        .ok_or(ResolveError::NoEmail)?
         .to_owned();
 
     let now = utc_now!();
@@ -348,6 +414,43 @@ mod tests {
     fn sanitize_respects_the_length_limit() {
         let long = "a".repeat(100);
         assert_eq!(sanitize(&long).len(), USERNAME_MAX);
+    }
+
+    #[test]
+    fn link_refusals_have_their_own_codes() {
+        let verified = SsoIdentity {
+            email_verified: Some(true),
+            ..Default::default()
+        };
+        let disabled = link_check(&verified, false).expect("linking is off");
+        assert_eq!(disabled.error.code(), "sso_link_disabled");
+
+        for flag in [Some(false), None] {
+            let identity = SsoIdentity {
+                email_verified: flag,
+                ..Default::default()
+            };
+            let refused = link_check(&identity, true).expect("unverified email");
+            assert_eq!(refused.error.code(), "sso_link_unverified_email", "{flag:?}");
+        }
+
+        assert!(link_check(&verified, true).is_none());
+    }
+
+    #[test]
+    fn resolve_errors_map_to_codes_and_keep_their_messages() {
+        assert_eq!(ResolveError::NoEmail.code(), "sso_no_email");
+        assert_eq!(
+            ResolveError::Internal(raise_error!("x".into(), ErrorCode::InternalError)).code(),
+            "sso_failed"
+        );
+        // The legacy wrapper still carries the operator-facing sentences.
+        let disabled: BichonError = ResolveError::LinkDisabled.into();
+        assert!(disabled.to_string().contains("BICHON_OIDC_LINK_BY_EMAIL"));
+        let unverified: BichonError = ResolveError::LinkUnverifiedEmail.into();
+        assert!(unverified.to_string().contains("verified"));
+        let no_email: BichonError = ResolveError::NoEmail.into();
+        assert_eq!(no_email.code(), ErrorCode::InvalidParameter);
     }
 
     #[test]

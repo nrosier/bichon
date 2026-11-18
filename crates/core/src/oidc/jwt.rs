@@ -524,6 +524,7 @@ mod tests {
             default_role_id: 100_200_000_000_000,
             auto_redirect: false,
             link_by_email: false,
+            allowed_email_domains: vec![],
         }
     }
 

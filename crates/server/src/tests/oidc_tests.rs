@@ -61,6 +61,7 @@ fn config(link_by_email: bool) -> OidcConfig {
         default_role_id: DEFAULT_MEMBER_ROLE_ID,
         auto_redirect: false,
         link_by_email,
+        allowed_email_domains: vec![],
     }
 }
 

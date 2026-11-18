@@ -61,6 +61,10 @@ pub struct OidcConfig {
     /// Adopt an existing Bichon account whose email matches the one the provider
     /// asserts. Off by default: see [`crate::oidc::user::resolve_or_provision`].
     pub link_by_email: bool,
+    /// Lowercased, normalized email domains allowed to sign in. Empty means no
+    /// restriction. Comes from the stored SSO document only; env-only setups
+    /// leave it empty.
+    pub allowed_email_domains: Vec<String>,
 }
 
 impl OidcConfig {
@@ -71,7 +75,6 @@ impl OidcConfig {
     pub fn load() -> BichonResult<Self> {
         // A stored document (saved from the SSO settings UI) overrides the six
         // UI-managed values wholesale; otherwise they come from the environment.
-        // `allowed_email_domains` is carried by the document but not enforced here.
         let src = load_stored().unwrap_or_else(env_fields);
 
         if !src.enabled {
@@ -114,6 +117,7 @@ impl OidcConfig {
             default_role_id: default_role_id()?,
             auto_redirect: auto_redirect()?,
             link_by_email: link_by_email()?,
+            allowed_email_domains: src.allowed_email_domains.clone(),
         })
     }
 

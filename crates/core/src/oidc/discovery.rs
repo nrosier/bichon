@@ -119,6 +119,41 @@ static CACHE: LazyLock<RwLock<Option<Cached>>> = LazyLock::new(|| RwLock::new(No
 
 /// Fetch the provider metadata, reusing the cached copy when it is still fresh.
 pub async fn provider_metadata(config: &OidcConfig) -> BichonResult<ProviderMetadata> {
+    provider_metadata_inner(config).await.map_err(into_bichon_error)
+}
+
+/// Like [`provider_metadata`], but a failure keeps its classification so the
+/// caller can report a stable `discovery_<kind>` code.
+pub async fn provider_metadata_classified(
+    config: &OidcConfig,
+) -> Result<ProviderMetadata, DiscoveryFailure> {
+    provider_metadata_inner(config)
+        .await
+        .map_err(|f| f.failure)
+}
+
+/// As [`provider_metadata_classified`], also returning the operator-facing
+/// message [`provider_metadata`] would have carried, so legacy wrappers can
+/// keep it verbatim.
+pub(crate) async fn provider_metadata_detailed(
+    config: &OidcConfig,
+) -> Result<ProviderMetadata, (DiscoveryFailure, crate::error::BichonError)> {
+    provider_metadata_inner(config).await.map_err(|f| {
+        let failure = f.failure.clone();
+        (failure, into_bichon_error(f))
+    })
+}
+
+fn into_bichon_error(f: Failed) -> crate::error::BichonError {
+    let code = if f.failure.kind.is_transport() {
+        ErrorCode::NetworkError
+    } else {
+        ErrorCode::HttpResponseError
+    };
+    raise_error!(f.message, code)
+}
+
+async fn provider_metadata_inner(config: &OidcConfig) -> Result<ProviderMetadata, Failed> {
     {
         let guard = CACHE.read().await;
         if let Some(cached) = guard.as_ref() {
@@ -141,20 +176,11 @@ pub async fn provider_metadata(config: &OidcConfig) -> BichonResult<ProviderMeta
     Ok(metadata)
 }
 
-async fn fetch(config: &OidcConfig) -> BichonResult<ProviderMetadata> {
+async fn fetch(config: &OidcConfig) -> Result<ProviderMetadata, Failed> {
     let url = config.discovery_url();
     debug!("fetching OIDC discovery document from {}", url);
 
-    fetch_classified(&url, &config.issuer_url)
-        .await
-        .map_err(|f| {
-            let code = if f.failure.kind.is_transport() {
-                ErrorCode::NetworkError
-            } else {
-                ErrorCode::HttpResponseError
-            };
-            raise_error!(f.message, code)
-        })
+    fetch_classified(&url, &config.issuer_url).await
 }
 
 /// A failure together with the operator-facing message the legacy error carried.
@@ -361,7 +387,7 @@ impl DiscoveryKind {
     }
 
     /// Kinds where no HTTP response was obtained.
-    fn is_transport(&self) -> bool {
+    pub(crate) fn is_transport(&self) -> bool {
         matches!(
             self,
             Self::Dns | Self::ConnectionRefused | Self::Timeout | Self::Tls | Self::Network
@@ -496,6 +522,7 @@ mod tests {
             default_role_id: 1,
             auto_redirect: false,
             link_by_email: false,
+            allowed_email_domains: vec![],
         };
         assert_eq!(
             config.discovery_url(),
