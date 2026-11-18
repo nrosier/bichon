@@ -36,8 +36,15 @@ pub mod discovery;
 pub mod flow;
 pub mod jwks;
 pub mod jwt;
+pub mod settings;
 pub mod store;
 pub mod user;
+
+pub use config::env_effective;
+pub use settings::{
+    apply_update, empty_view, invalidate_stored_cache, load_stored, save_stored, SsoConfigView,
+    SsoStoredConfig, SsoUpdate, SsoValidationError,
+};
 
 /// Value stored in [`crate::users::BichonUserV2::sso_provider`] for users
 /// authenticated through this module.
