@@ -218,6 +218,7 @@ jobs:
             CRATE_VERSION=${{ github.ref_name }}
             GIT_COMMIT=${{ github.sha }}
             BUILT_AT=${{ steps.stamp.outputs.built_at }}
+            IMAGE_SOURCE=${{ github.server_url }}/${{ github.repository }}
 
       - name: Scan the image
         # This is the gate. A CRITICAL or HIGH with a fix available stops the
