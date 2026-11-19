@@ -36,7 +36,7 @@ bichon-blob.workspace = true
 mail-parser.workspace = true
 bytes.workspace = true
 uuid.workspace = true
-tantivy = { version = "0.26.1", features = ["zstd-compression", "quickwit"] }
+tantivy = { version = "0.27.0", features = ["zstd-compression", "quickwit"] }
 chrono.workspace = true
 tracing.workspace = true
 

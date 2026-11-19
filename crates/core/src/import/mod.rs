@@ -272,11 +272,14 @@ pub fn update_progress(import_id: &str, progress: ImportProgress) {
 /// Check free disk space (in bytes) on the temp directory's filesystem.
 pub fn check_temp_disk_space() -> BichonResult<u64> {
     use sysinfo::Disks;
-    let disks = Disks::new_with_refreshed_list();
+    let Ok(disks) = Disks::new_with_refreshed_list() else {
+        // Fallback: if the disk list is unavailable, report plenty of space
+        return Ok(u64::MAX);
+    };
     let temp_path = &DATA_DIR_MANAGER.temp_dir;
     // Use the canonical path so we can match mount points
     let canonical = std::fs::canonicalize(temp_path).unwrap_or_else(|_| temp_path.clone());
-    for disk in disks.list() {
+    for disk in disks.iter() {
         if canonical.starts_with(disk.mount_point()) {
             return Ok(disk.available_space());
         }
