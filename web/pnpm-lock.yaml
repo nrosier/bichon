@@ -8,7 +8,7 @@ overrides:
   picomatch@2: ^4.0.0
   postcss: ^8.5.18
   brace-expansion@1: ^1.1.22
-  brace-expansion@2: ^2.1.8
+  brace-expansion@2: ^5.0.0
   brace-expansion@5: ^5.0.13
   glob@10: ^13.0.0
   lodash: ^4.17.24
