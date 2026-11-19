@@ -1,8 +1,7 @@
+import type { TFunction } from 'i18next'
 import { z } from 'zod'
 
-export const getFormSchema = (
-  t: (key: string, options?: Record<string, any>) => string
-) =>
+export const getFormSchema = (t: TFunction) =>
   z.object({
     username: z
       .string()
