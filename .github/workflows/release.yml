@@ -21,7 +21,7 @@ jobs:
     strategy:
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
 
     steps:
@@ -52,6 +52,15 @@ jobs:
           target: ${{ matrix.target }}
           override: true
 
+      # The image is alpine (musl), which has no glibc loader, so a gnu binary
+      # fails there with "exec ... No such file or directory". Build a static
+      # musl binary, as docker.yml does; musl-gcc is the linker for it.
+      - name: Install musl build tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq musl-tools
+
       - name: Setup Node.js & pnpm
         uses: actions/setup-node@v7
         with:
@@ -67,12 +76,30 @@ jobs:
       - name: Build frontend (web)
         working-directory: ./web
         run: |
-          pnpm install
+          pnpm install --frozen-lockfile
           pnpm run build
 
       - name: Build Rust backend
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: |
-          cargo build --release --target=${{ matrix.target }}
+          cargo build --release --locked --target=${{ matrix.target }}
+
+      # A binary with an ELF interpreter needs a dynamic loader the alpine image
+      # does not have; refuse to ship one rather than publish an image that
+      # cannot start.
+      - name: Check the binaries are static
+        run: |
+          set -euo pipefail
+          for binary in ${{ env.BINARY_NAME }} ${{ env.BINARY_CLI }} ${{ env.BINARY_ADMIN }}; do
+            path="target/${{ matrix.target }}/release/$binary"
+            if readelf -l "$path" | grep -q 'Requesting program interpreter'; then
+              echo "::error::$binary is dynamically linked: $(readelf -l "$path" | grep 'program interpreter')"
+              exit 1
+            fi
+            echo "$binary: static"
+          done
 
       - name: Strip binary
         run: |
@@ -151,7 +178,7 @@ jobs:
       - name: Download Linux x86_64 artifact
         uses: actions/download-artifact@v8
         with:
-          name: x86_64-unknown-linux-gnu
+          name: x86_64-unknown-linux-musl
           path: artifacts
 
       - name: Extract the amd64 binaries
@@ -160,7 +187,7 @@ jobs:
           # The Dockerfile copies from <arch>/ so one context could serve several
           # architectures. Only amd64 is published.
           mkdir -p docker/amd64
-          AMD64_FILE=$(ls artifacts | grep x86_64-unknown-linux-gnu.tar.gz)
+          AMD64_FILE=$(ls artifacts | grep x86_64-unknown-linux-musl.tar.gz)
           echo "Extracting $AMD64_FILE"
           tar -xzf "artifacts/$AMD64_FILE" -C docker/amd64
           ls -l docker/amd64
