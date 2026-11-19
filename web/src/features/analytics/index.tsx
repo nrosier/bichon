@@ -10,6 +10,7 @@ import { useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from '@tanstack/react-router'
 import { useTranslation } from 'react-i18next'
+import type { TFunction } from 'i18next'
 import { format } from 'date-fns'
 import {
   AlertCircle,
@@ -376,7 +377,7 @@ function rangeLabel(
   rangeKey: string,
   since: number | undefined,
   before: number | undefined,
-  t: (key: string, defaultValue: string, options?: Record<string, unknown>) => string
+  t: TFunction
 ): string {
   if (rangeKey === 'all') {
     return t('analytics.rangeAllTime', 'All time')
