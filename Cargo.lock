@@ -283,9 +283,22 @@ version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "048006790404103c488e6c5616b3e7e702a71292aadda08e8f7698a9e0d2eb53"
 dependencies = [
- "aws-lc-sys",
+ "aws-lc-sys 0.47.0",
  "untrusted 0.7.1",
  "zeroize",
+]
+
+[[package]]
+name = "aws-lc-sys"
+version = "0.46.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1622d8446a2d4b2ce0c7eefc73dd43a99779028d5ee5c2dd8073a658ba8a2bc"
+dependencies = [
+ "cc",
+ "cmake",
+ "dunce",
+ "fs_extra",
+ "pkg-config",
 ]
 
 [[package]]
@@ -341,7 +354,7 @@ dependencies = [
  "hex",
  "indicatif",
  "itertools 0.15.0",
- "mail-parser",
+ "mail-parser 0.11.9",
  "native_db",
  "native_model",
  "serde",
@@ -386,7 +399,7 @@ dependencies = [
  "console",
  "dialoguer",
  "indicatif",
- "mail-parser",
+ "mail-parser 0.11.9",
  "memmap2",
  "outlook-pst",
  "reqwest 0.12.28",
@@ -426,7 +439,7 @@ dependencies = [
  "itertools 0.15.0",
  "itoa",
  "lru 0.18.5",
- "mail-parser",
+ "mail-parser 0.11.9",
  "mail-send",
  "memmap2",
  "murmur3",
@@ -1419,6 +1432,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "34aa73646ffb006b8f5147f3dc182bd4bcb190227ce861fc4a4844bf8e3cb2c0"
 
 [[package]]
+name = "encodify"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e95d6e27686e1d6991a3077f4dbec9d33d18903466d234165ad86cd08c3ebc79"
+dependencies = [
+ "memchr",
+ "simdutf8",
+]
+
+[[package]]
 name = "encoding_rs"
 version = "0.8.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1468,7 +1491,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e35d6e78f4cebb90e51d543db8fe41528851d6deeef6ef21ebd4bfdc1e784776"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1886,6 +1909,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "hashify"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04a037b1848eada162d6534c206770180e6bfc0eaa97292250c3e7179d8b1f73"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.10",
 ]
 
 [[package]]
@@ -2510,9 +2544,9 @@ checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
 name = "lettre"
-version = "0.11.23"
+version = "0.11.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2c646bd5cc763b1087b15493e29a64be6147ba8f19342004fa52048ee596eae"
+checksum = "f294f3d7cdb313e578acef7d7727d4e8d897e0fcd0d6d58c19959cec95073f19"
 dependencies = [
  "base64 0.23.1",
  "email-encoding",
@@ -2653,43 +2687,36 @@ dependencies = [
 
 [[package]]
 name = "mail-auth"
-version = "0.12.1"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "faa246141b9a9194be268605d9db7228784a0eb347d155eeaa223181037693d0"
+checksum = "96848b9e5340bf531190f600e978310907e4ddfd7757868cb999f59b382d274b"
 dependencies = [
  "aws-lc-rs",
- "flate2",
+ "aws-lc-sys 0.46.0",
+ "encodify",
  "getrandom 0.2.17",
  "getrandom 0.4.3",
- "hashify",
+ "hashify 0.3.2",
  "hickory-resolver",
  "idna",
- "mail-builder 0.4.4",
- "mail-parser",
- "quick-xml 0.41.0",
+ "mail-parser 1.0.1",
+ "memchr",
  "rustls-pki-types",
  "serde",
  "serde_json",
+ "simdutf8",
  "similar",
- "zip",
 ]
 
 [[package]]
 name = "mail-builder"
-version = "0.4.4"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "900998f307338c4013a28ab14d760b784067324b164448c6d98a89e44810473b"
+checksum = "aca3ad941e4c466402151719d6b4cea4bdfcb212b11e5970afa75e7d28c6502a"
 dependencies = [
+ "encodify",
  "gethostname",
-]
-
-[[package]]
-name = "mail-builder"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c942e8a4b83f9351236c1e531ea9fa0237913d63c7fc36818430e0128a1ddf3"
-dependencies = [
- "gethostname",
+ "web-time",
 ]
 
 [[package]]
@@ -2698,21 +2725,33 @@ version = "0.11.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ec00bda90c6e645a54506c630c2820cd6b1890cfd2b0a169b50f74b2b8c7c86"
 dependencies = [
- "encoding_rs",
- "hashify",
+ "hashify 0.2.9",
  "serde",
 ]
 
 [[package]]
-name = "mail-send"
-version = "0.6.2"
+name = "mail-parser"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8355326d14f08c9de5e9badfe606d9ba8fea2febb60fe4318ecbac33cfb7b41e"
+checksum = "3d4ea9311ef3ca6189aa85c5f984bd47b2f12079bcabae28917d900ab26c9ecc"
 dependencies = [
- "base64 0.23.1",
+ "encodify",
+ "encoding_rs",
+ "hashify 0.3.2",
+ "memchr",
+ "simdutf8",
+]
+
+[[package]]
+name = "mail-send"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a428956cced7e5493be6631590e009825635f6ffc3f19edbbf9e07418f8f2e2"
+dependencies = [
+ "encodify",
  "gethostname",
  "mail-auth",
- "mail-builder 0.5.0",
+ "mail-builder",
  "md5",
  "rand 0.9.5",
  "rustls",
@@ -3025,7 +3064,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3828,7 +3867,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4240,7 +4279,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4308,7 +4347,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5032,7 +5071,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5443,12 +5482,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
 
 [[package]]
-name = "typed-path"
-version = "0.12.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54ec2755506471f54baf5e4bb5499d8e510cc1caf271270e778a736bd2d7336c"
-
-[[package]]
 name = "typeid"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5851,7 +5884,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6237,19 +6270,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.10",
-]
-
-[[package]]
-name = "zip"
-version = "8.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
-dependencies = [
- "crc32fast",
- "flate2",
- "indexmap",
- "memchr",
- "typed-path",
 ]
 
 [[package]]

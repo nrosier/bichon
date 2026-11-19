@@ -17,6 +17,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import { z } from 'zod'
+import { invalidTypeError } from '@/lib/zod-errors'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { toast } from '@/hooks/use-toast'
@@ -62,7 +63,7 @@ const createSchema = (t: any) => z.object({
     .or(z.literal('')),
   expire_in: z
     .number({
-      invalid_type_error: t('users.tokens.schema.expire_number'),
+      error: invalidTypeError(t('users.tokens.schema.expire_number')),
     })
     .int(t('users.tokens.schema.expire_int'))
     .positive(t('users.tokens.schema.expire_positive'))

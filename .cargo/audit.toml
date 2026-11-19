@@ -28,4 +28,8 @@ ignore = [
     # (YAML rendering of the OpenAPI spec). Unmaintained, not vulnerable; poem
     # 3.1.12 is the latest release and still depends on serde_yaml.
     "RUSTSEC-2024-0449",
+    # chrono, humantime and pin-utils: no fixed version
+    "RUSTSEC-2026-0543",
+    "RUSTSEC-2026-0542",
+    "RUSTSEC-2026-0441",
 ]
