@@ -80,11 +80,10 @@ pub async fn handle_account_export(
         break p;
     };
 
-    let disks = Disks::new_with_refreshed_list();
+    let disks = Disks::new_with_refreshed_list().ok();
     let disk_result = disks
-        .list()
-        .iter()
-        .find(|d| path.starts_with(d.mount_point()))
+        .as_ref()
+        .and_then(|disks| disks.iter().find(|d| path.starts_with(d.mount_point())))
         .ok_or_else(|| "Could not identify the disk for the provided path.");
 
     match disk_result {

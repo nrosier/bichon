@@ -23,5 +23,8 @@ export default defineConfig({
     environment: 'jsdom',
     setupFiles: './src/test/setup.ts',
     css: false,
+    // Node >= 25 ships its own Web Storage global, which is undefined without
+    // --localstorage-file and shadows jsdom's localStorage in test workers.
+    execArgv: ['--no-experimental-webstorage'],
   },
 })

@@ -123,9 +123,11 @@ fn check_free_space_against(
 /// blocks on a guess.
 pub(crate) fn available_space_on(dir: &Path) -> u64 {
     use sysinfo::Disks;
-    let disks = Disks::new_with_refreshed_list();
+    let Ok(disks) = Disks::new_with_refreshed_list() else {
+        return u64::MAX;
+    };
     let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-    for disk in disks.list() {
+    for disk in disks.iter() {
         if canonical.starts_with(disk.mount_point()) {
             return disk.available_space();
         }

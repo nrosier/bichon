@@ -38,7 +38,7 @@ urlencoding.workspace = true
 sysinfo.workspace = true
 base64.workspace = true
 uuid.workspace = true
-sha2 = "0.10"
+sha2 = "0.11"
 # Deflate-only keeps the feature set minimal.
 zip = { version = "9.7", default-features = false, features = ["deflate"] }
 

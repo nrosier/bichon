@@ -187,9 +187,11 @@ fn append_default_leaf(parent: &Path, leaf: &str) -> PathBuf {
 /// mount point cannot be located. Mirrors `import::check_temp_disk_space`.
 pub fn available_space(dir: &Path) -> u64 {
     use sysinfo::Disks;
-    let disks = Disks::new_with_refreshed_list();
+    let Ok(disks) = Disks::new_with_refreshed_list() else {
+        return u64::MAX;
+    };
     let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-    for disk in disks.list() {
+    for disk in disks.iter() {
         if canonical.starts_with(disk.mount_point()) {
             return disk.available_space();
         }

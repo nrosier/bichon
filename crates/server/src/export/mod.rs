@@ -429,11 +429,10 @@ fn estimate_attachments(
 /// Verifies there is enough free disk space for the estimated export size.
 fn check_disk_space(required: u64) -> BichonResult<()> {
     let dir = export_root_dir();
-    let disks = sysinfo::Disks::new_with_refreshed_list();
+    let disks = sysinfo::Disks::new_with_refreshed_list().ok();
     let disk = disks
-        .list()
-        .iter()
-        .find(|d| dir.starts_with(d.mount_point()))
+        .as_ref()
+        .and_then(|disks| disks.iter().find(|d| dir.starts_with(d.mount_point())))
         .ok_or_else(|| {
             raise_error!(
                 "Could not identify the disk for the export directory.".into(),

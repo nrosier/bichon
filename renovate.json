@@ -2,6 +2,9 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:recommended"],
   "schedule": ["before 6am on monday"],
+  "minimumReleaseAge": "1 day",
+  "internalChecksFilter": "strict",
+  "description": "minimumReleaseAge matches pnpm 11's default 1-day minimumReleaseAge; without it Renovate proposes releases that `pnpm install --frozen-lockfile` rejects in CI with ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION (PRs #34, #42).",
   "lockFileMaintenance": {
     "enabled": true,
     "schedule": ["before 6am on monday"]
