@@ -1,10 +1,11 @@
 import { z } from 'zod'
+import { requiredError } from '@/lib/zod-errors'
 
 export const profileSchema = (t: (key: string) => string) =>
   z.object({
     username: z
       .string({
-        required_error: t('settings.profile.validation.username.required'),
+        error: requiredError(t('settings.profile.validation.username.required')),
       })
       .min(3, {
         message: t('settings.profile.validation.username.min'),
@@ -15,7 +16,7 @@ export const profileSchema = (t: (key: string) => string) =>
 
     email: z
       .string({
-        required_error: t('settings.profile.validation.email.required'),
+        error: requiredError(t('settings.profile.validation.email.required')),
       })
       .email({
         message: t('settings.profile.validation.email.invalid'),
@@ -35,3 +36,4 @@ export const profileSchema = (t: (key: string) => string) =>
   })
 
 export type ProfileFormValues = z.infer<ReturnType<typeof profileSchema>>
+export type ProfileFormInput = z.input<ReturnType<typeof profileSchema>>
