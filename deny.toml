@@ -47,6 +47,12 @@ ignore = [
     # (YAML rendering of the OpenAPI spec). Unmaintained, not vulnerable; poem
     # 3.1.12 is the latest release and still depends on serde_yaml.
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml via serde_yaml via poem; unmaintained, not vulnerable, no poem release moves off it" },
+    # chrono: unmaintained, not vulnerable. No fixed version exists.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; no fixed version exists" },
+    # humantime: unmaintained, not vulnerable. No fixed version exists.
+    { id = "RUSTSEC-2026-0542", reason = "humantime unmaintained; no fixed version exists" },
+    # pin-utils: unmaintained, not vulnerable. No fixed version exists.
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils unmaintained; no fixed version exists" },
 ]
 
 [licenses]

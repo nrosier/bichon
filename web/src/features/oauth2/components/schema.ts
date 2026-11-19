@@ -1,19 +1,20 @@
 import { z } from 'zod'
+import { requiredError } from '@/lib/zod-errors'
 
 const paramEntry = (t: (key: string) => string) =>
   z.object({
     key: z
-      .string({ required_error: t('oauth2.keyIsRequired') })
+      .string({ error: requiredError(t('oauth2.keyIsRequired')) })
       .min(1, t('oauth2.keyCannotBeEmpty')),
     value: z
-      .string({ required_error: t('oauth2.valueIsRequired') })
+      .string({ error: requiredError(t('oauth2.valueIsRequired')) })
       .min(1, t('oauth2.valueCannotBeEmpty')),
   })
 
 const scopeEntry = (t: (key: string) => string) =>
   z.object({
     value: z
-      .string({ required_error: t('oauth2.valueIsRequired') })
+      .string({ error: requiredError(t('oauth2.valueIsRequired')) })
       .min(1, t('oauth2.valueCannotBeEmpty')),
   })
 
@@ -25,28 +26,28 @@ export const getOAuth2Schema = (t: (key: string) => string) =>
       .optional(),
     client_id: z
       .string({
-        required_error: t('oauth2.clientIdIsRequired'),
+        error: requiredError(t('oauth2.clientIdIsRequired')),
       })
       .min(1, { message: t('oauth2.clientIdCannotBeEmpty') }),
     client_type: z.enum(['Confidential', 'Public'], {
-      required_error: t('oauth2.clientTypeIsRequired'),
+      error: requiredError(t('oauth2.clientTypeIsRequired')),
     }),
     client_secret: z.string().optional(),
     auth_url: z
       .string({
-        required_error: t('oauth2.authorizationUrlIsRequired'),
+        error: requiredError(t('oauth2.authorizationUrlIsRequired')),
       })
       .min(1, { message: t('oauth2.authorizationUrlCannotBeEmpty') })
       .url({ message: t('oauth2.invalidAuthorizationUrlFormat') }),
     token_url: z
       .string({
-        required_error: t('oauth2.tokenUrlIsRequired'),
+        error: requiredError(t('oauth2.tokenUrlIsRequired')),
       })
       .min(1, { message: t('oauth2.tokenUrlCannotBeEmpty') })
       .url({ message: t('oauth2.invalidTokenUrlFormat') }),
     redirect_uri: z
       .string({
-        required_error: t('oauth2.redirectUriIsRequired'),
+        error: requiredError(t('oauth2.redirectUriIsRequired')),
       })
       .min(1, { message: t('oauth2.redirectUriCannotBeEmpty') })
       .url({ message: t('oauth2.invalidRedirectUriFormat') }),
@@ -60,12 +61,9 @@ export type OAuth2FormValues = z.infer<ReturnType<typeof getOAuth2Schema>>
 
 export const getImportTokensSchema = (t: (key: string) => string) =>
   z.object({
-    account_id: z
-      .number({ invalid_type_error: t('oauth2.accountIsRequired') })
-      .optional()
-      .refine((value) => value !== undefined, {
-        message: t('oauth2.accountIsRequired'),
-      }),
+    // zod 4 skips `.optional().refine()` when the key is absent, so the required
+    // message is raised by the number type itself (missing or wrong type alike).
+    account_id: z.number({ error: () => t('oauth2.accountIsRequired') }),
     // `.trim()` also strips surrounding whitespace from the submitted value, which is
     // what a copy-paste out of devtools tends to carry.
     access_token: z

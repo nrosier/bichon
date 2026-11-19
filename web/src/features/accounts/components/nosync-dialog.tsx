@@ -18,6 +18,7 @@
 
 
 import { z } from 'zod';
+import { requiredError } from '@/lib/zod-errors';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -39,7 +40,7 @@ import { useTranslation } from 'react-i18next';
 const accountSchema = (t: (key: string) => string) =>
   z.object({
     account_name: z.string().optional(),
-    email: z.string({ required_error: t('validation.emailRequired') }).email({ message: t('validation.invalidEmail') }),
+    email: z.string({ error: requiredError(t('validation.emailRequired')) }).email({ message: t('validation.invalidEmail') }),
     enabled: z.boolean()
   });
 

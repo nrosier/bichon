@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { requiredError, invalidTypeError } from '@/lib/zod-errors'
 import { isValidRegex } from '@/lib/pattern-utils'
 
 const encryptionSchema = z.union([
@@ -37,7 +38,7 @@ export const getImapConfigSchema = (
 ) =>
   z.object({
     host: z
-      .string({ required_error: t('validation.imapHostRequired') })
+      .string({ error: requiredError(t('validation.imapHostRequired')) })
       .min(1, { message: t('validation.imapHostCannotBeEmpty') }),
     port: z
       .number()
@@ -127,7 +128,7 @@ export const getAccountSchema = (isEdit: boolean, t: (key: string) => string) =>
     account_name: z.string().optional(),
     login_name: z.string().optional(),
     email: z
-      .string({ required_error: t('validation.emailRequired') })
+      .string({ error: requiredError(t('validation.emailRequired')) })
       .email({ message: t('validation.invalidEmail') }),
     imap: getImapConfigSchema(isEdit, t),
     enabled: z.boolean(),
@@ -136,7 +137,7 @@ export const getAccountSchema = (isEdit: boolean, t: (key: string) => string) =>
     date_before: relativeDateSchema(t).optional(),
     download_interval_min: z
       .number({
-        invalid_type_error: t('validation.incrementalSyncMustBeNumber'),
+        error: invalidTypeError(t('validation.incrementalSyncMustBeNumber')),
       })
       .int()
       .min(1, {
@@ -144,7 +145,7 @@ export const getAccountSchema = (isEdit: boolean, t: (key: string) => string) =>
       }),
     download_batch_size: z
       .number({
-        invalid_type_error: t('validation.singleRequestBatchSizeMustBeNumber'),
+        error: invalidTypeError(t('validation.singleRequestBatchSizeMustBeNumber')),
       })
       .int()
       .min(10, {
@@ -155,7 +156,7 @@ export const getAccountSchema = (isEdit: boolean, t: (key: string) => string) =>
       }),
     max_email_size_bytes: z
       .number({
-        invalid_type_error: t('validation.maxEmailSizeMustBeNumber'),
+        error: invalidTypeError(t('validation.maxEmailSizeMustBeNumber')),
       })
       .int()
       .min(1 * 1024 * 1024, { message: t('validation.maxEmailSizeTooSmall') })
@@ -180,7 +181,7 @@ export const getAccountSchema = (isEdit: boolean, t: (key: string) => string) =>
     override_from_headers: z.array(nonEmptyRuleItem(t)).optional(),
     retention_days: z
       .number({
-        invalid_type_error: t('validation.retentionDaysMustBeNumber'),
+        error: invalidTypeError(t('validation.retentionDaysMustBeNumber')),
       })
       .int()
       .min(0, { message: t('validation.retentionDaysMustBeNonNegative') })
@@ -188,7 +189,7 @@ export const getAccountSchema = (isEdit: boolean, t: (key: string) => string) =>
       .optional(),
     min_retention_days: z
       .number({
-        invalid_type_error: t('validation.retentionDaysMustBeNumber'),
+        error: invalidTypeError(t('validation.retentionDaysMustBeNumber')),
       })
       .int()
       .min(0, { message: t('validation.retentionDaysMustBeNonNegative') })

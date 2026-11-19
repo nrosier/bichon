@@ -35,3 +35,9 @@ overrides:
   nanoid@3: ^6.0.0
   # Several host-confusion/SSRF/path-traversal advisories in URI parsing.
   fast-uri@3: ^4.0.0
+  # Three follow-redirects advisories (GHSA-q3jh-wrc6-jgq8, GHSA-8r9p-f939-6h3c, GHSA-mrwp-f3q8-3g9p).
+  follow-redirects: ^1.16.2
+  # zod 4 line only (GHSA-mrhx-c7xc-m3w5); zod 3 is a separate major and is left alone.
+  zod@4: ^4.6.6
+  # Four seroval advisories, fixed in 1.6.8.
+  seroval: ^1.6.8
