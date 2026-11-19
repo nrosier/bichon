@@ -156,13 +156,16 @@ impl IndexStore {
             .open_table(INDEX_TABLE)
             .map_err(|e| crate::error::Error::IndexDb(format!("open table: {}", e)))?;
 
-        match table
+        // Bound to a local so the guard, which borrows `table` under redb 5,
+        // is dropped before `table` rather than at the end of the block.
+        let record = match table
             .get(key)
             .map_err(|e| crate::error::Error::IndexDb(format!("get: {}", e)))?
         {
-            Some(guard) => Ok(Some(IndexRecord::decode(&guard.value().0)?)),
-            None => Ok(None),
-        }
+            Some(guard) => Some(IndexRecord::decode(&guard.value().0)?),
+            None => None,
+        };
+        Ok(record)
     }
 
     /// Check whether a key exists (non-tombstone) in the store.
