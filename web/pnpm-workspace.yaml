@@ -22,9 +22,13 @@ overrides:
   picomatch@2: ^4.0.0
   # Arbitrary file read, and path traversal via a previous source map.
   postcss: ^8.5.18
-  # Three separate DoS advisories, one per release line present.
-  brace-expansion@1: ^5.0.0
-  brace-expansion@2: ^5.0.0
+  # DoS advisories (GHSA-q2hr-2g5m-vwhr and earlier), each fixed inside every
+  # release line. Stay in-line: 5.x drops the default export that minimatch 3
+  # (eslint's config-array) calls, which made eslint crash with "expand is not
+  # a function".
+  brace-expansion@1: ^1.1.22
+  brace-expansion@2: ^2.1.8
+  brace-expansion@5: ^5.0.13
   # Command injection in the glob CLI.
   glob@10: ^13.0.0
   # Code injection via _.template.
